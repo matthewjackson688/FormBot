@@ -1105,6 +1105,8 @@ const doneToggleInFlight = new Set(); // rowSerial keys currently toggling done/
 const doneStateOverrides = new Map(); // rowSerial -> { done, expiresAt }
 const pingHiddenByRow = new Map(); // rowSerial -> true when ping was already used for current done cycle
 const LIVE_MESSAGE_REFRESH_MS = 15_000;
+const RESERVATIONS_CACHE_MAX_AGE_MS = 10 * 60_000;
+const RESERVATIONS_FORCE_REPOST_MS = 60 * 60_000;
 let startupStickyDelayUntil = 0;
 let lastTimersText = null;
 let lastTimersTextAt = 0;
@@ -1368,6 +1370,7 @@ async function findPanelMessages(channel, client) {
 function startReservationsInterval(client, channelId, messageId) {
   let inFlight = false;
   let lastBottomCheckAt = 0;
+  let lastForcedRepostAt = Date.now();
   const BOTTOM_CHECK_MS = 3000;
   const tick = async () => {
     if (inFlight) return;
@@ -1379,12 +1382,19 @@ function startReservationsInterval(client, channelId, messageId) {
     try {
       updated = await fetchReservationsText({ cacheOnly: true });
       hadSnapshot = !!updated;
-      if (!updated) return;
+      if (!updated) {
+        refreshTimersSnapshotInBackground().catch(() => {});
+        return;
+      }
 
       const ch = await getTextBasedChannel(client, channelId);
       if (!ch?.isTextBased()) return;
       let shouldRepostAtBottom = false;
-      if (Date.now() >= startupStickyDelayUntil && Date.now() - lastBottomCheckAt >= BOTTOM_CHECK_MS) {
+      const now = Date.now();
+      if (now - lastForcedRepostAt >= RESERVATIONS_FORCE_REPOST_MS) {
+        shouldRepostAtBottom = true;
+        lastForcedRepostAt = now;
+      } else if (now >= startupStickyDelayUntil && now - lastBottomCheckAt >= BOTTOM_CHECK_MS) {
         lastBottomCheckAt = Date.now();
         try {
           const latest = await ch.messages.fetch({ limit: 1 });
@@ -1978,7 +1988,10 @@ function renderReservationsTextFromSnapshot() {
 async function fetchReservationsText(opts = {}) {
   const cacheOnly = !!opts.cacheOnly;
   const now = Date.now();
-  if (cacheOnly) return renderReservationsTextFromSnapshot();
+  if (cacheOnly) {
+    if (!timersSnapshot || now - timersSnapshotAt > RESERVATIONS_CACHE_MAX_AGE_MS) return null;
+    return renderReservationsTextFromSnapshot();
+  }
   if (now < timersNextFetchAttemptAt) return null;
   if (!timersSnapshot || now - timersSnapshotAt >= TIMERS_REFRESH_MS) {
     await fetchTimersText();
@@ -3520,7 +3533,7 @@ client.on("interactionCreate", async (interaction) => {
     // /spreadsheet
     if (interaction.isChatInputCommand() && interaction.commandName === "spreadsheet") {
       return interaction.reply({
-        content: "https://docs.google.com/spreadsheets/d/1P8ZeMLRpwzg3wjaElc6OoUfnw6eUy6G8MT0TfCjWQZA/edit?gid=1555567410#gid=1555567410",
+        content: "https://docs.google.com/spreadsheets/d/16dFXHy_ul9b97Yap5OU2jj5FcDxeU37YQeZg04IDVc8/edit?usp=sharing",
         flags: MessageFlags.Ephemeral,
       });
     }
@@ -4461,4 +4474,5 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
+
 
