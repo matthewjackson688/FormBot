@@ -3422,6 +3422,10 @@ const reservationsCommand = new SlashCommandBuilder()
   .setName("reservations")
   .setDescription("Show the next reservation time for each title.");
 
+const refreshCommand = new SlashCommandBuilder()
+  .setName("refresh")
+  .setDescription("Force a fresh pull from the sheet and update messages.");
+
 const statusCommand = new SlashCommandBuilder()
   .setName("status")
   .setDescription("Show bot health and integration status.");
@@ -3438,6 +3442,7 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
     spreadsheetCommand.toJSON(),
     timersCommand.toJSON(),
     reservationsCommand.toJSON(),
+    refreshCommand.toJSON(),
     statusCommand.toJSON(),
     perfCommand.toJSON(),
   ];
@@ -3612,6 +3617,43 @@ client.on("interactionCreate", async (interaction) => {
         content: "https://docs.google.com/spreadsheets/d/16dFXHy_ul9b97Yap5OU2jj5FcDxeU37YQeZg04IDVc8/edit?usp=sharing",
         flags: MessageFlags.Ephemeral,
       });
+    }
+
+    // /refresh
+    if (interaction.isChatInputCommand() && interaction.commandName === "refresh") {
+      if (!interaction.memberPermissions?.has("Administrator")) {
+        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "❌ You need Administrator to use this." });
+      }
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      } catch (e) {
+        if (isUnknownInteractionError(e)) return;
+        throw e;
+      }
+
+      const startedAt = Date.now();
+      resetTimersSnapshot("manual_refresh");
+      let ok = false;
+      try {
+        const text = await fetchTimersText();
+        ok = !!text;
+      } catch (e) {
+        console.error("manual refresh failed:", e);
+      }
+
+      try {
+        await updateAllTimersMessages(client);
+        await updateAllReservationsMessages(client);
+      } catch (e) {
+        console.error("manual refresh update failed:", e);
+      }
+
+      const tookMs = Date.now() - startedAt;
+      if (!ok) {
+        return interaction.editReply("❌ Refresh failed (check logs / SheetDB rate limits).");
+      }
+      const source = SHEETDB_URL ? "SheetDB" : "Apps Script";
+      return interaction.editReply(`✅ Refreshed from ${source} in ${tookMs}ms.`);
     }
 
     // /status
