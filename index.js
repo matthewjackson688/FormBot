@@ -3646,57 +3646,83 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const startedAt = Date.now();
-      resetTimersSnapshot("manual_refresh");
-      lastSnapshotReconcileAt = 0;
-      snapshotReconcileInFlight = false;
-      pendingSnapshotReconcile = null;
-      let ok = false;
-      try {
-        const text = await fetchTimersText();
-        ok = !!text;
-      } catch (e) {
-        console.error("manual refresh failed:", e);
+      const refreshPromise = (async () => {
+        resetTimersSnapshot("manual_refresh");
+        lastSnapshotReconcileAt = 0;
+        snapshotReconcileInFlight = false;
+        pendingSnapshotReconcile = null;
+        let ok = false;
+        try {
+          const text = await fetchTimersText();
+          ok = !!text;
+        } catch (e) {
+          console.error("manual refresh failed:", e);
+        }
+
+        try {
+          const debugRow = (timersSnapshot?.rowStates || []).find((r) => String(r?.serial) === "224");
+          if (debugRow) {
+            console.log("manual refresh debug row 224:", {
+              serial: debugRow.serial,
+              reservationUtc: debugRow.reservationUtc,
+              done: debugRow.done,
+              reminder: debugRow.reminder,
+              username: debugRow.username,
+              coordinates: debugRow.coordinates,
+            });
+          } else {
+            console.log("manual refresh debug row 224: not found");
+          }
+          if (timersSnapshot?.rowStates) {
+            // Force a reconcile even if a previous loop got stuck.
+            reservationStateSyncInFlight = false;
+            await reconcileReservationState(timersSnapshot.rowStates);
+          }
+          if (timersSnapshot?.activeSerials) {
+            await reconcileDeletedReservations(timersSnapshot.activeSerials);
+          }
+        } catch (e) {
+          console.error("manual refresh reconcile failed:", e);
+        }
+
+        try {
+          await updateAllTimersMessages(client);
+          await updateAllReservationsMessages(client);
+        } catch (e) {
+          console.error("manual refresh update failed:", e);
+        }
+
+        const tookMs = Date.now() - startedAt;
+        const source = SHEETDB_URL ? "SheetDB" : "Apps Script";
+        return { ok, tookMs, source };
+      })();
+
+      const timeoutMs = 5000;
+      const timed = await Promise.race([
+        refreshPromise,
+        sleep(timeoutMs).then(() => ({ timeout: true })),
+      ]);
+
+      if (timed?.timeout) {
+        await interaction.editReply("⏳ Refresh running… I’ll post a result shortly.");
+        refreshPromise
+          .then((result) => {
+            if (!result?.ok) {
+              return interaction.followUp({ flags: MessageFlags.Ephemeral, content: "❌ Refresh failed (check logs)." });
+            }
+            return interaction.followUp({
+              flags: MessageFlags.Ephemeral,
+              content: `✅ Refreshed from ${result.source} in ${result.tookMs}ms.`,
+            });
+          })
+          .catch(() => {});
+        return;
       }
 
-      try {
-        const debugRow = (timersSnapshot?.rowStates || []).find((r) => String(r?.serial) === "224");
-        if (debugRow) {
-          console.log("manual refresh debug row 224:", {
-            serial: debugRow.serial,
-            reservationUtc: debugRow.reservationUtc,
-            done: debugRow.done,
-            reminder: debugRow.reminder,
-            username: debugRow.username,
-            coordinates: debugRow.coordinates,
-          });
-        } else {
-          console.log("manual refresh debug row 224: not found");
-        }
-        if (timersSnapshot?.rowStates) {
-          // Force a reconcile even if a previous loop got stuck.
-          reservationStateSyncInFlight = false;
-          await reconcileReservationState(timersSnapshot.rowStates);
-        }
-        if (timersSnapshot?.activeSerials) {
-          await reconcileDeletedReservations(timersSnapshot.activeSerials);
-        }
-      } catch (e) {
-        console.error("manual refresh reconcile failed:", e);
+      if (!timed?.ok) {
+        return interaction.editReply("❌ Refresh failed (check logs).");
       }
-
-      try {
-        await updateAllTimersMessages(client);
-        await updateAllReservationsMessages(client);
-      } catch (e) {
-        console.error("manual refresh update failed:", e);
-      }
-
-      const tookMs = Date.now() - startedAt;
-      if (!ok) {
-        return interaction.editReply("❌ Refresh failed (check logs / SheetDB rate limits).");
-      }
-      const source = SHEETDB_URL ? "SheetDB" : "Apps Script";
-      return interaction.editReply(`✅ Refreshed from ${source} in ${tookMs}ms.`);
+      return interaction.editReply(`✅ Refreshed from ${timed.source} in ${timed.tookMs}ms.`);
     }
 
     // /status
