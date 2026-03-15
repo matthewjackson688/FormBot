@@ -2263,12 +2263,17 @@ async function reconcileDeletedReservations(activeSerials) {
   }
 }
 
-function upsertEmbedField(fields, name, value, inline = true) {
+function upsertEmbedField(fields, name, value, inline = true, preferredName = null) {
   const idx = fields.findIndex((f) => String(f.name || "").toLowerCase().includes(String(name).toLowerCase()));
   if (idx >= 0) {
-    fields[idx] = { ...fields[idx], value: String(value), inline: fields[idx].inline ?? inline };
+    fields[idx] = {
+      ...fields[idx],
+      name: preferredName || fields[idx].name,
+      value: String(value),
+      inline: fields[idx].inline ?? inline,
+    };
   } else {
-    fields.push({ name, value: String(value), inline });
+    fields.push({ name: preferredName || name, value: String(value), inline });
   }
 }
 
@@ -2381,7 +2386,7 @@ async function reconcileReservationState(rowStates) {
       if (String(rowState.title || "").trim()) {
         upsertEmbedField(fields, "Title", String(rowState.title).trim(), true);
       }
-      upsertEmbedField(fields, "Reservation", reservationStr, true);
+      upsertEmbedField(fields, "Reservation", reservationStr, true, "🕒 Reservation (UTC)");
       embed.setFields(fields);
       if (completed) {
         embed.setColor(0x777777).setFooter({ text: "Completed" });
