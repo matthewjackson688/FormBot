@@ -1630,7 +1630,18 @@ async function fetchTimersSnapshotFromSheetDb() {
 
     const title = String(getRowValue(row, ["Title", "TITLE", "title"]) || "").trim();
     const done = parseBool(getRowValue(row, ["Done", "DONE", "done"]));
-    const reservationRaw = String(getRowValue(row, ["Reservation (UTC)", "RESERVATION (UTC)", "reservationUtc", "reservation_utc"]) || "").trim();
+    const reservationRaw = String(
+      getRowValue(row, [
+        "Reservation (UTC)",
+        "Reservations (UTC)",
+        "RESERVATION (UTC)",
+        "RESERVATIONS (UTC)",
+        "reservationUtc",
+        "reservation_utc",
+        "reservationsUtc",
+        "reservations_utc",
+      ]) || ""
+    ).trim();
     const reservationStr = normalizeReservationDisplay(reservationRaw);
     const reminder = parseBool(getRowValue(row, ["Reminder", "REMINDER", "reminder"]));
     const pingUsed = parseBool(getRowValue(row, ["Pinged", "PINGED", "pinged", "Ping Used", "PING_USED", "pingUsed", "ping_used"]));
