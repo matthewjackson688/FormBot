@@ -3633,6 +3633,9 @@ client.on("interactionCreate", async (interaction) => {
 
       const startedAt = Date.now();
       resetTimersSnapshot("manual_refresh");
+      lastSnapshotReconcileAt = 0;
+      snapshotReconcileInFlight = false;
+      pendingSnapshotReconcile = null;
       let ok = false;
       try {
         const text = await fetchTimersText();
