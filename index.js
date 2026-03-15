@@ -2356,7 +2356,14 @@ async function reconcileReservationState(rowStates) {
         if (requestChannel?.isTextBased()) {
           requestMsg = await requestChannel.messages.fetch(ref.requestMessageId);
         }
-      } catch {}
+      } catch (e) {
+        console.error("reservation reconcile fetch failed:", {
+          serial,
+          channelId: ref.requestChannelId,
+          messageId: ref.requestMessageId,
+          error: e?.message || e,
+        });
+      }
       if (!requestMsg) continue;
 
       const reservationStr = normalizeReservationDisplay(rowState.reservationUtc);
@@ -2422,7 +2429,14 @@ async function reconcileReservationState(rowStates) {
 
       try {
         await requestMsg.edit({ embeds: [embed], components: [actionRow] });
-      } catch {}
+      } catch (e) {
+        console.error("reservation reconcile edit failed:", {
+          serial,
+          channelId: ref.requestChannelId,
+          messageId: ref.requestMessageId,
+          error: e?.message || e,
+        });
+      }
 
       if (!reminderEnabled) {
         cancelReminder(serial);
