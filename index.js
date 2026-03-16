@@ -2344,7 +2344,10 @@ async function reconcileReservationState(rowStates) {
 
   reservationStateSyncInFlight = true;
   if (rowStates.some((r) => String(r?.serial || "") === "224")) {
-    console.log("reconcile debug 224: start", { count: rowStates.length });
+    const values = rowStates
+      .filter((r) => String(r?.serial || "") === "224")
+      .map((r) => String(r?.reservationUtc || ""));
+    console.log("reconcile debug 224: start", { count: rowStates.length, occurrences: values.length, values });
   }
   try {
     for (const rowState of rowStates) {
@@ -2441,7 +2444,13 @@ async function reconcileReservationState(rowStates) {
       try {
         await requestMsg.edit({ embeds: [embed], components: [actionRow] });
         if (serial === "224") {
-          console.log("reconcile debug 224 after edit");
+          try {
+            const latest = await requestMsg.fetch();
+            const latestReservation = getReservationFromEmbed(latest);
+            console.log("reconcile debug 224 after edit", { latestReservation });
+          } catch (e) {
+            console.log("reconcile debug 224 after edit (fetch failed)", { error: e?.message || e });
+          }
         }
       } catch (e) {
         console.error("reservation reconcile edit failed:", {
