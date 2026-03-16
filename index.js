@@ -2343,6 +2343,9 @@ async function reconcileReservationState(rowStates) {
   if (!Array.isArray(rowStates) || !runtimeClient) return;
 
   reservationStateSyncInFlight = true;
+  if (rowStates.some((r) => String(r?.serial || "") === "224")) {
+    console.log("reconcile debug 224: start", { count: rowStates.length });
+  }
   try {
     for (const rowState of rowStates) {
       const serial = String(rowState?.serial || "");
@@ -2484,6 +2487,9 @@ async function reconcileReservationState(rowStates) {
       });
     }
   } finally {
+    if (rowStates.some((r) => String(r?.serial || "") === "224")) {
+      console.log("reconcile debug 224: done");
+    }
     reservationStateSyncInFlight = false;
   }
 }
@@ -3684,11 +3690,17 @@ client.on("interactionCreate", async (interaction) => {
           } else {
             console.log("manual refresh debug row 224: not found");
           }
-          if (timersSnapshot?.rowStates) {
-            // Force a reconcile even if a previous loop got stuck.
-            reservationStateSyncInFlight = false;
-            await reconcileReservationState(timersSnapshot.rowStates);
+        if (timersSnapshot?.rowStates) {
+          // Force a reconcile even if a previous loop got stuck.
+          reservationStateSyncInFlight = false;
+          const debugRow = (timersSnapshot.rowStates || []).find((r) => String(r?.serial) === "224");
+          if (debugRow) {
+            console.log("manual refresh reconcile 224: start");
+            await reconcileReservationState([debugRow]);
+            console.log("manual refresh reconcile 224: done");
           }
+          await reconcileReservationState(timersSnapshot.rowStates);
+        }
           if (timersSnapshot?.activeSerials) {
             await reconcileDeletedReservations(timersSnapshot.activeSerials);
           }
