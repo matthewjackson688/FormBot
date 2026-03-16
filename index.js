@@ -2343,12 +2343,6 @@ async function reconcileReservationState(rowStates) {
   if (!Array.isArray(rowStates) || !runtimeClient) return;
 
   reservationStateSyncInFlight = true;
-  if (rowStates.some((r) => String(r?.serial || "") === "224")) {
-    const values = rowStates
-      .filter((r) => String(r?.serial || "") === "224")
-      .map((r) => String(r?.reservationUtc || ""));
-    console.log("reconcile debug 224: start", { count: rowStates.length, occurrences: values.length, values });
-  }
   try {
     for (const rowState of rowStates) {
       const serial = String(rowState?.serial || "");
@@ -2402,14 +2396,6 @@ async function reconcileReservationState(rowStates) {
 
       const existingEmbed = requestMsg.embeds?.[0] || null;
       const rowUsername = String(rowState.username || "").trim();
-      if (serial === "224") {
-        console.log("reconcile debug 224 before:", {
-          reservationFromRow: reservationStr,
-          reservationFromEmbed: getReservationFromEmbed(requestMsg),
-          messageId: ref.requestMessageId,
-          channelId: ref.requestChannelId,
-        });
-      }
       const embed = existingEmbed
         ? EmbedBuilder.from(existingEmbed)
         : new EmbedBuilder().setTitle(rowUsername === "#TEST" ? "📋 TEST" : "📋 New Title Request");
@@ -2443,15 +2429,6 @@ async function reconcileReservationState(rowStates) {
 
       try {
         await requestMsg.edit({ embeds: [embed], components: [actionRow] });
-        if (serial === "224") {
-          try {
-            const latest = await requestMsg.fetch();
-            const latestReservation = getReservationFromEmbed(latest);
-            console.log("reconcile debug 224 after edit", { latestReservation });
-          } catch (e) {
-            console.log("reconcile debug 224 after edit (fetch failed)", { error: e?.message || e });
-          }
-        }
       } catch (e) {
         console.error("reservation reconcile edit failed:", {
           serial,
@@ -2496,9 +2473,6 @@ async function reconcileReservationState(rowStates) {
       });
     }
   } finally {
-    if (rowStates.some((r) => String(r?.serial || "") === "224")) {
-      console.log("reconcile debug 224: done");
-    }
     reservationStateSyncInFlight = false;
   }
 }
@@ -3686,28 +3660,9 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         try {
-          const debugRow = (timersSnapshot?.rowStates || []).find((r) => String(r?.serial) === "224");
-          if (debugRow) {
-            console.log("manual refresh debug row 224:", {
-              serial: debugRow.serial,
-              reservationUtc: debugRow.reservationUtc,
-              done: debugRow.done,
-              reminder: debugRow.reminder,
-              username: debugRow.username,
-              coordinates: debugRow.coordinates,
-            });
-          } else {
-            console.log("manual refresh debug row 224: not found");
-          }
         if (timersSnapshot?.rowStates) {
           // Force a reconcile even if a previous loop got stuck.
           reservationStateSyncInFlight = false;
-          const debugRow = (timersSnapshot.rowStates || []).find((r) => String(r?.serial) === "224");
-          if (debugRow) {
-            console.log("manual refresh reconcile 224: start");
-            await reconcileReservationState([debugRow]);
-            console.log("manual refresh reconcile 224: done");
-          }
           await reconcileReservationState(timersSnapshot.rowStates);
         }
           if (timersSnapshot?.activeSerials) {
