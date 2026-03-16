@@ -2396,6 +2396,14 @@ async function reconcileReservationState(rowStates) {
 
       const existingEmbed = requestMsg.embeds?.[0] || null;
       const rowUsername = String(rowState.username || "").trim();
+      if (serial === "224") {
+        console.log("reconcile debug 224 before:", {
+          reservationFromRow: reservationStr,
+          reservationFromEmbed: getReservationFromEmbed(requestMsg),
+          messageId: ref.requestMessageId,
+          channelId: ref.requestChannelId,
+        });
+      }
       const embed = existingEmbed
         ? EmbedBuilder.from(existingEmbed)
         : new EmbedBuilder().setTitle(rowUsername === "#TEST" ? "📋 TEST" : "📋 New Title Request");
@@ -2429,6 +2437,9 @@ async function reconcileReservationState(rowStates) {
 
       try {
         await requestMsg.edit({ embeds: [embed], components: [actionRow] });
+        if (serial === "224") {
+          console.log("reconcile debug 224 after edit");
+        }
       } catch (e) {
         console.error("reservation reconcile edit failed:", {
           serial,
