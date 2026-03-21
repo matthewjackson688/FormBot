@@ -1252,7 +1252,7 @@ function parseDmDateToken(value) {
   const day = Number(match[1]);
   const month = Number(match[2]);
   const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
-  const dt = DateTime.fromObject({ year, month, day, zone: "utc" });
+  const dt = DateTime.fromObject({ year, month, day }, { zone: "utc" });
   if (!dt.isValid) return null;
   return dt;
 }
@@ -1266,7 +1266,7 @@ function parseDmRangeToken(value) {
     const day = Number(timeMatch[3]);
     const month = Number(timeMatch[4]);
     const year = timeMatch[5].length === 2 ? 2000 + Number(timeMatch[5]) : Number(timeMatch[5]);
-    const dt = DateTime.fromObject({ year, month, day, hour, minute, zone: "utc" });
+    const dt = DateTime.fromObject({ year, month, day, hour, minute }, { zone: "utc" });
     if (!dt.isValid) return null;
     return { dt, hasTime: true };
   }
@@ -3921,28 +3921,41 @@ client.on("messageCreate", async (message) => {
 
       const session = startDmExportSession(message.author.id, `${guildId}:${channelId}`);
       await message.reply(`Streaming ${filter.label} from #${channel.name || channel.id} in ${guild.name}. Send \`stop\` to cancel.`);
-      const messages = await fetchChannelMessages(channel, filter, session);
-      if (session.cancelled) {
-        finishDmExportSession(message.author.id, session);
-        await message.author.send("Export stopped.");
-        return;
-      }
-      const transcript = buildChannelTranscript(guild, channel, messages, filter.label);
-      const chunks = chunkText(transcript);
-      for (let i = 0; i < chunks.length; i += 1) {
+      try {
+        const messages = await fetchChannelMessages(channel, filter, session);
         if (session.cancelled) {
-          await message.author.send(`Export stopped after ${i} chunk${i === 1 ? "" : "s"}.`);
           finishDmExportSession(message.author.id, session);
+          await message.author.send("Export stopped.");
           return;
         }
-        await message.author.send(chunks[i]);
-        if (i < chunks.length - 1) {
-          await sleep(200);
+        const transcript = buildChannelTranscript(guild, channel, messages, filter.label);
+        const chunks = chunkText(transcript);
+        for (let i = 0; i < chunks.length; i += 1) {
+          if (session.cancelled) {
+            await message.author.send(`Export stopped after ${i} chunk${i === 1 ? "" : "s"}.`);
+            finishDmExportSession(message.author.id, session);
+            return;
+          }
+          await message.author.send(chunks[i]);
+          if (i < chunks.length - 1) {
+            await sleep(200);
+          }
         }
+        finishDmExportSession(message.author.id, session);
+        await message.author.send(`Export complete. Sent ${chunks.length} chunk${chunks.length === 1 ? "" : "s"}.`);
+        return;
+      } catch (err) {
+        console.error("DM export failed:", err);
+        finishDmExportSession(message.author.id, session);
+        const code = getDiscordErrorCode(err);
+        const hint =
+          code === 50013 ? "Missing permissions (View Channel / Read Message History)." :
+          code === 50001 ? "Missing access to that channel." :
+          code === 10003 ? "Unknown channel." :
+          "";
+        await message.reply(`❌ Export failed. ${hint || "Check the logs for details."}`.trim());
+        return;
       }
-      finishDmExportSession(message.author.id, session);
-      await message.author.send(`Export complete. Sent ${chunks.length} chunk${chunks.length === 1 ? "" : "s"}.`);
-      return;
     }
 
     const guildId = request.guildId;
