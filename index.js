@@ -1296,6 +1296,19 @@ function parseDmChannelRequest(content) {
     return { type: "guild_only", guildId: guildOnlyMatch[1] };
   }
 
+  const guildSearchMatch = String(content || "").trim().match(/^(\d{17,20})\s+"([^"]+)"(?:\s+(\d+))?$/);
+  if (guildSearchMatch) {
+    const countRaw = guildSearchMatch[3];
+    const count = countRaw ? Number(countRaw) : null;
+    if (countRaw && (!Number.isFinite(count) || count <= 0)) return null;
+    return {
+      type: "guild_search",
+      guildId: guildSearchMatch[1],
+      searchTerm: guildSearchMatch[2],
+      count,
+    };
+  }
+
   const guildChannelMatch = String(content || "").trim().match(/^(\d{17,20})\s*:\s*(\d{17,20})(?:\s+(.+))?$/);
   if (!guildChannelMatch) return null;
 
@@ -1418,6 +1431,126 @@ function buildChannelTranscript(guild, channel, messages, filterLabel = "all rea
       : "unknown_time";
     const author = message.author?.tag || message.author?.username || "Unknown User";
     lines.push(`[${createdAt}] **${author}**`);
+
+    const content = String(message.content || "").trim();
+    if (content) {
+      lines.push(content);
+    }
+
+    if (message.attachments?.size) {
+      for (const attachment of message.attachments.values()) {
+        lines.push(`[Attachment] ${attachment.name || "file"}: ${attachment.url}`);
+      }
+    }
+
+    if (message.embeds?.length) {
+      for (const embed of message.embeds) {
+        const embedParts = [];
+        if (embed.title) embedParts.push(`title=${embed.title}`);
+        if (embed.description) embedParts.push(`description=${embed.description}`);
+        if (embed.url) embedParts.push(`url=${embed.url}`);
+        if (embedParts.length) {
+          lines.push(`[Embed] ${embedParts.join(" | ")}`);
+        } else {
+          lines.push("[Embed]");
+        }
+      }
+    }
+
+    if (!content && !message.attachments?.size && !message.embeds?.length) {
+      lines.push("[No text content]");
+    }
+
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+const MAX_GUILD_SEARCH_MATCHES = 500;
+const MAX_GUILD_CHANNEL_SCAN_MESSAGES = 2000;
+
+async function fetchGuildSearchMatches(guild, searchTerm, count = null, session = null) {
+  const regex = new RegExp(`\\b${escapeRegex(searchTerm)}\\b`, "i");
+  const matches = [];
+  let truncated = false;
+
+  const channels = Array.from(guild.channels.cache.values())
+    .filter((channel) => channel?.isTextBased?.() && channel?.viewable && "messages" in channel)
+    .sort((a, b) => {
+      const positionA = Number(a?.rawPosition ?? 0);
+      const positionB = Number(b?.rawPosition ?? 0);
+      if (positionA !== positionB) return positionA - positionB;
+      return String(a?.name || "").localeCompare(String(b?.name || ""));
+    });
+
+  for (const channel of channels) {
+    if (session?.cancelled) break;
+    let before;
+    let scanned = 0;
+    while (true) {
+      if (session?.cancelled) break;
+      const batch = await channel.messages.fetch({ limit: 100, before });
+      if (!batch.size) break;
+      const items = Array.from(batch.values());
+      scanned += items.length;
+
+      for (const message of items) {
+        const haystacks = [
+          String(message.content || ""),
+          ...Array.from(message.embeds || []).flatMap((embed) => [
+            String(embed.title || ""),
+            String(embed.description || ""),
+          ]),
+          ...Array.from(message.attachments?.values?.() || []).map((attachment) => String(attachment.name || "")),
+        ];
+        if (haystacks.some((value) => regex.test(value))) {
+          matches.push({ message, channel });
+          if (matches.length >= MAX_GUILD_SEARCH_MATCHES) {
+            truncated = true;
+            break;
+          }
+        }
+      }
+
+      if (truncated) break;
+      before = items[items.length - 1]?.id;
+      if (batch.size < 100) break;
+      if (scanned >= MAX_GUILD_CHANNEL_SCAN_MESSAGES) {
+        truncated = true;
+        break;
+      }
+    }
+    if (truncated) break;
+  }
+
+  matches.sort((a, b) => b.message.createdTimestamp - a.message.createdTimestamp);
+  let selected = matches;
+  if (count && matches.length > count) {
+    selected = matches.slice(0, count);
+  }
+  selected.sort((a, b) => a.message.createdTimestamp - b.message.createdTimestamp);
+
+  return { matches: selected, truncated };
+}
+
+function buildGuildSearchTranscript(guild, matches, filterLabel, truncated = false) {
+  const lines = [
+    `Guild: ${guild.name} (${guild.id})`,
+    `Selection: ${filterLabel}${truncated ? " (capped)" : ""}`,
+    `Exported At: ${DateTime.now().setZone("utc").toFormat("HH:mm dd/MM/yyyy 'GMT'")}`,
+    `Message Count: ${matches.length}`,
+    "",
+  ];
+
+  for (const entry of matches) {
+    const { message, channel } = entry;
+    const createdAt = message.createdAt
+      ? DateTime.fromJSDate(message.createdAt, { zone: "utc" }).toFormat("HH:mm dd/MM/yyyy 'GMT'")
+      : "unknown_time";
+    const author = message.author?.tag || message.author?.username || "Unknown User";
+    const channelLabel = channel?.name ? `#${channel.name}` : channel?.id || "unknown_channel";
+    lines.push(`[${createdAt}] ${channelLabel} **${author}**`);
 
     const content = String(message.content || "").trim();
     if (content) {
@@ -3876,14 +4009,77 @@ client.on("messageCreate", async (message) => {
     }
 
     if (!content) {
-      await message.reply("Send `guild_id`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id 13:30 18/02/26 - 13:55 18/02/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
+      await message.reply("Send `guild_id`, `guild_id \"cat\"`, `guild_id \"cat\" 10`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id 13:30 18/02/26 - 13:55 18/02/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
       return;
     }
 
     const request = parseDmChannelRequest(content);
     if (!request) {
-      await message.reply("Send `guild_id`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id 13:30 18/02/26 - 13:55 18/02/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
+      await message.reply("Send `guild_id`, `guild_id \"cat\"`, `guild_id \"cat\" 10`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id 13:30 18/02/26 - 13:55 18/02/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
       return;
+    }
+
+    if (request.type === "guild_search") {
+      const { guildId, searchTerm, count } = request;
+      let guild;
+      try {
+        guild = await client.guilds.fetch(guildId);
+      } catch {
+        await message.reply("I can't access that server. Make sure I'm in it and the ID is correct.");
+        return;
+      }
+
+      const existingSession = getActiveDmExport(message.author.id);
+      if (existingSession && !existingSession.cancelled) {
+        await message.reply("A search/export is already running. Send `stop` first if you want to cancel it.");
+        return;
+      }
+
+      const label = count
+        ? `most recent ${count} messages containing "${searchTerm}"`
+        : `all readable messages containing "${searchTerm}"`;
+      const session = startDmExportSession(message.author.id, `${guildId}:search`);
+      await message.reply(`Searching ${label} in ${guild.name}. Send \`stop\` to cancel.`);
+
+      try {
+        try {
+          await guild.channels.fetch();
+        } catch {}
+
+        const { matches, truncated } = await fetchGuildSearchMatches(guild, searchTerm, count, session);
+        if (session.cancelled) {
+          finishDmExportSession(message.author.id, session);
+          await message.author.send("Search stopped.");
+          return;
+        }
+
+        const transcript = buildGuildSearchTranscript(guild, matches, label, truncated);
+        const chunks = chunkText(transcript);
+        for (let i = 0; i < chunks.length; i += 1) {
+          if (session.cancelled) {
+            await message.author.send(`Search stopped after ${i} chunk${i === 1 ? "" : "s"}.`);
+            finishDmExportSession(message.author.id, session);
+            return;
+          }
+          await message.author.send(chunks[i]);
+          if (i < chunks.length - 1) {
+            await sleep(200);
+          }
+        }
+        finishDmExportSession(message.author.id, session);
+        await message.author.send(`Search complete. Sent ${chunks.length} chunk${chunks.length === 1 ? "" : "s"}.`);
+        return;
+      } catch (err) {
+        console.error("DM guild search failed:", err);
+        finishDmExportSession(message.author.id, session);
+        const code = getDiscordErrorCode(err);
+        const hint =
+          code === 50013 ? "Missing permissions (View Channel / Read Message History)." :
+          code === 50001 ? "Missing access to one of the channels." :
+          "";
+        await message.reply(`❌ Search failed. ${hint || "Check the logs for details."}`.trim());
+        return;
+      }
     }
 
     if (request.type === "channel_export") {
