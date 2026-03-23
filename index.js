@@ -2541,9 +2541,27 @@ function getReservationUsername(item) {
   return "Unknown";
 }
 
+function getManualReservationStartsByTitle(titles, nowMs = Date.now()) {
+  const titleSet = new Set(titles);
+  const byTitle = new Map();
+  for (const entry of Object.values(manualReminderStore)) {
+    const remindAtMs = Number(entry?.remindAtMs);
+    if (!Number.isFinite(remindAtMs) || remindAtMs <= nowMs) continue;
+    const title = String(entry?.title || "").trim();
+    if (!titleSet.has(title)) continue;
+    if (!byTitle.has(title)) byTitle.set(title, []);
+    byTitle.get(title).push(remindAtMs);
+  }
+  for (const list of byTitle.values()) {
+    list.sort((a, b) => a - b);
+  }
+  return byTitle;
+}
+
 function renderTimersTextFromSnapshot() {
   if (!timersSnapshot) return null;
   const ageSeconds = Math.max(0, Math.floor((Date.now() - timersSnapshotAt) / 1000));
+  const nowMs = Date.now();
   const byTitle = new Map((timersSnapshot.timers || []).map((t) => [String(t.title), Number(t.elapsedSeconds) + ageSeconds]));
   const nextByTitle = new Map((timersSnapshot.nextReservations || []).map((t) => [
     String(t.title),
@@ -2558,6 +2576,23 @@ function renderTimersTextFromSnapshot() {
     { secondsUntil: Number(t.secondsUntil) - ageSeconds, reservationUtc: String(t.reservationUtc || "") },
   ]));
   const titles = ["Governor", "Architect", "Prefect", "General"];
+  const manualStartsByTitle = getManualReservationStartsByTitle(titles, nowMs);
+
+  for (const title of titles) {
+    const manualStarts = manualStartsByTitle.get(title);
+    if (!manualStarts || manualStarts.length === 0) continue;
+    const manualNextMs = manualStarts[0];
+    const current = nextByTitle.get(title);
+    const currentMs = current && Number.isFinite(current.secondsUntil)
+      ? nowMs + current.secondsUntil * 1000
+      : null;
+    if (!Number.isFinite(currentMs) || manualNextMs < currentMs) {
+      nextByTitle.set(title, {
+        secondsUntil: Math.max(0, Math.floor((manualNextMs - nowMs) / 1000)),
+        reservationUtc: formatUTCDateTime(new Date(manualNextMs)),
+      });
+    }
+  }
   const formatTimestamp = (secondsUntil, style = "f") => {
     if (!Number.isFinite(secondsUntil)) return null;
     const unix = Math.floor((Date.now() + secondsUntil * 1000) / 1000);
@@ -2581,6 +2616,38 @@ function renderTimersTextFromSnapshot() {
     const mm = Math.floor(remaining / 60);
     return `${mm}m`;
   };
+  for (const title of titles) {
+    const manualStarts = manualStartsByTitle.get(title) || [];
+    const hasManual = manualStarts.length > 0;
+    const cooldownSeconds = Number(activeCooldownByTitle.get(title));
+    const hasActiveCooldown = Number.isFinite(cooldownSeconds) && cooldownSeconds > 0;
+    const existing = nextPossibleByTitle.get(title);
+    const existingMs = existing && Number.isFinite(existing.secondsUntil)
+      ? nowMs + existing.secondsUntil * 1000
+      : null;
+    if (!existingMs && !hasManual && !hasActiveCooldown) continue;
+
+    let candidateMs = Number.isFinite(existingMs)
+      ? Math.max(existingMs, Math.ceil(nowMs / 60000) * 60000)
+      : Math.ceil(nowMs / 60000) * 60000;
+
+    if (hasActiveCooldown) {
+      const cooldownMs = nowMs + cooldownSeconds * 1000;
+      if (cooldownMs > candidateMs) candidateMs = cooldownMs;
+    }
+
+    for (const startMs of manualStarts) {
+      if (candidateMs + 3600_000 <= startMs) break;
+      const reservationEnd = startMs + 3600_000;
+      if (candidateMs < reservationEnd) candidateMs = reservationEnd;
+    }
+
+    nextPossibleByTitle.set(title, {
+      secondsUntil: Math.max(0, Math.floor((candidateMs - nowMs) / 1000)),
+      reservationUtc: formatUTCDateTime(new Date(candidateMs)),
+    });
+  }
+
   const formatNextPossible = (title, next) => {
     const hasUpcomingReservation = nextByTitle.has(title);
     const cooldownSeconds = Number(activeCooldownByTitle.get(title));
@@ -2700,11 +2767,29 @@ async function fetchTimersText(opts = {}) {
 function renderReservationsTextFromSnapshot() {
   if (!timersSnapshot) return null;
   const ageSeconds = Math.max(0, Math.floor((Date.now() - timersSnapshotAt) / 1000));
+  const nowMs = Date.now();
   const nextByTitle = new Map((timersSnapshot.nextReservations || []).map((t) => [
     String(t.title),
     { secondsUntil: Number(t.secondsUntil) - ageSeconds, reservationUtc: String(t.reservationUtc || "") },
   ]));
   const titles = ["Governor", "Architect", "Prefect", "General"];
+  const manualStartsByTitle = getManualReservationStartsByTitle(titles, nowMs);
+
+  for (const title of titles) {
+    const manualStarts = manualStartsByTitle.get(title);
+    if (!manualStarts || manualStarts.length === 0) continue;
+    const manualNextMs = manualStarts[0];
+    const current = nextByTitle.get(title);
+    const currentMs = current && Number.isFinite(current.secondsUntil)
+      ? nowMs + current.secondsUntil * 1000
+      : null;
+    if (!Number.isFinite(currentMs) || manualNextMs < currentMs) {
+      nextByTitle.set(title, {
+        secondsUntil: Math.max(0, Math.floor((manualNextMs - nowMs) / 1000)),
+        reservationUtc: formatUTCDateTime(new Date(manualNextMs)),
+      });
+    }
+  }
   const formatTimestamp = (secondsUntil, style = "f") => {
     if (!Number.isFinite(secondsUntil)) return null;
     const unix = Math.floor((Date.now() + secondsUntil * 1000) / 1000);
@@ -3506,6 +3591,42 @@ function buildRemindSetupMessage(draft = {}) {
     `Username: ${username}`,
     `Time: ${timeInput}`,
   ].join("\n");
+}
+
+function collectOutstandingReminders(nowMs = Date.now()) {
+  const items = [];
+
+  for (const [key, entry] of Object.entries(manualReminderStore)) {
+    const remindAtMs = Number(entry?.remindAtMs);
+    if (!Number.isFinite(remindAtMs) || remindAtMs <= nowMs) continue;
+    items.push({
+      kind: "manual",
+      id: key,
+      remindAtMs,
+      title: entry?.title || "Title",
+      username: entry?.username || "Username",
+    });
+  }
+
+  for (const [key, entry] of Object.entries(remindersStore)) {
+    if (entry?.firedAtMs) continue;
+    let remindAtMs = Number(entry?.remindAtMs);
+    if (!Number.isFinite(remindAtMs) && entry?.reservationStr) {
+      const parsed = parseReservationUTC(String(entry.reservationStr));
+      if (parsed) remindAtMs = parsed.getTime();
+    }
+    if (!Number.isFinite(remindAtMs) || remindAtMs <= nowMs) continue;
+    items.push({
+      kind: "reservation",
+      id: key,
+      remindAtMs,
+      title: entry?.title || "Title",
+      username: entry?.username || "Username",
+    });
+  }
+
+  items.sort((a, b) => a.remindAtMs - b.remindAtMs);
+  return items;
 }
 
 function scheduleEphemeralDelete(message) {
@@ -4321,6 +4442,10 @@ const remindCommand = new SlashCommandBuilder()
   .setName("remind")
   .setDescription("Create a manual reminder.");
 
+const listCommand = new SlashCommandBuilder()
+  .setName("list")
+  .setDescription("List outstanding reminders that haven't fired yet.");
+
 const refreshCommand = new SlashCommandBuilder()
   .setName("refresh")
   .setDescription("Force a fresh pull from the sheet and update messages.");
@@ -4342,6 +4467,7 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
     timersCommand.toJSON(),
     reservationsCommand.toJSON(),
     remindCommand.toJSON(),
+    listCommand.toJSON(),
     refreshCommand.toJSON(),
     statusCommand.toJSON(),
     perfCommand.toJSON(),
@@ -4901,6 +5027,27 @@ client.on("interactionCreate", async (interaction) => {
       });
       scheduleEphemeralDelete(reply);
       return;
+    }
+
+    // /list
+    if (interaction.isChatInputCommand() && interaction.commandName === "list") {
+      const items = collectOutstandingReminders();
+      if (!items.length) {
+        return interaction.reply({
+          flags: MessageFlags.Ephemeral,
+          content: "No outstanding reminders.",
+        });
+      }
+      const lines = items.slice(0, 40).map((item) => {
+        const stamp = Math.floor(item.remindAtMs / 1000);
+        const kind = item.kind === "manual" ? "Manual" : "Reservation";
+        return `${kind}: ${item.username} — ${item.title} — <t:${stamp}:F>`;
+      });
+      const extra = items.length > 40 ? `\n…and ${items.length - 40} more.` : "";
+      return interaction.reply({
+        flags: MessageFlags.Ephemeral,
+        content: lines.join("\n").slice(0, 1900) + extra,
+      });
     }
 
     // timezone picker select (IANA)
