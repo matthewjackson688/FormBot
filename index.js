@@ -5048,7 +5048,7 @@ client.on("interactionCreate", async (interaction) => {
       const extra = items.length > 40 ? `\n…and ${items.length - 40} more.` : "";
       return interaction.reply({
         flags: MessageFlags.Ephemeral,
-        content: `\n${lines.join("\n").slice(0, 1900)}${extra}`,
+        content: `\u200b\n${lines.join("\n").slice(0, 1900)}${extra}`,
       });
     }
 
