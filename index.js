@@ -153,6 +153,7 @@ const RESERVATIONS_STORE_PATH = path.join(__dirname, "reservations-messages.json
 const RESERVATION_OWNER_STORE_PATH = path.join(__dirname, "reservation-owners.json");
 const RESERVATION_MESSAGE_STORE_PATH = path.join(__dirname, "reservation-messages.json");
 const REMINDER_STORE_PATH = path.join(__dirname, "reminders-store.json");
+const MANUAL_REMINDER_STORE_PATH = path.join(__dirname, "manual-reminders.json");
 const AUDIT_LOG_PATH = path.join(__dirname, "audit.log");
 const REQUEST_LOG_PATH = path.join(__dirname, "request.log");
 const BUTTON_LOG_PATH = path.join(__dirname, "button-logs.ndjson");
@@ -1024,6 +1025,147 @@ function parseDateParts(input, tz) {
   return null;
 }
 
+function normalizeNumberWords(input) {
+  const map = {
+    zero: "0",
+    one: "1",
+    two: "2",
+    three: "3",
+    four: "4",
+    five: "5",
+    six: "6",
+    seven: "7",
+    eight: "8",
+    nine: "9",
+    ten: "10",
+    eleven: "11",
+    twelve: "12",
+  };
+  return String(input || "").replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/gi, (m) => {
+    const key = m.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : m;
+  });
+}
+
+function parseRelativeDurationMs(input) {
+  if (!input) return null;
+  let raw = String(input).toLowerCase().trim();
+  if (!raw) return null;
+  if (raw.startsWith("in ")) raw = raw.slice(3).trim();
+  raw = raw.replace(/\band\b/g, " ");
+  raw = normalizeNumberWords(raw);
+
+  let hours = 0;
+  let minutes = 0;
+
+  const compact = raw.match(/(\d+)\s*h(?:ours?|rs?)?\s*(\d+)\s*m?/);
+  if (compact) {
+    hours += Number(compact[1] || 0);
+    minutes += Number(compact[2] || 0);
+  }
+
+  const hourMatches = raw.matchAll(/(\d+)\s*(hours?|hrs?|hr|h)\b/g);
+  for (const m of hourMatches) {
+    hours += Number(m[1] || 0);
+  }
+
+  const minuteMatches = raw.matchAll(/(\d+)\s*(minutes?|mins?|min|m)\b/g);
+  for (const m of minuteMatches) {
+    minutes += Number(m[1] || 0);
+  }
+
+  // Handle "1 hour 30" (minutes without explicit unit)
+  if (minutes === 0 && hours > 0) {
+    const remainder = raw
+      .replace(/(\d+)\s*(hours?|hrs?|hr|h)\b/g, "")
+      .replace(/(\d+)\s*(minutes?|mins?|min|m)\b/g, "")
+      .trim();
+    const leftover = remainder.match(/(\d+)/);
+    if (leftover) minutes = Number(leftover[1] || 0);
+  }
+
+  const totalMinutes = hours * 60 + minutes;
+  if (!Number.isFinite(totalMinutes) || totalMinutes <= 0) return null;
+  return totalMinutes * 60_000;
+}
+
+function extractDateToken(raw) {
+  const lower = String(raw || "").toLowerCase();
+  if (/\btoday\b/.test(lower)) return "today";
+  if (/\btomorrow\b/.test(lower)) return "tomorrow";
+  for (const day of weekdays) {
+    if (new RegExp(`\\b${day}\\b`).test(lower)) return day;
+  }
+  const m = lower.match(/(\d{1,2}[\/.\-]\d{1,2}(?:[\/.\-]\d{2,4})?)/);
+  if (m) return m[1].replace(/[.\-]/g, "/");
+  return null;
+}
+
+function extractTimeToken(raw) {
+  const lower = String(raw || "").toLowerCase();
+  const m = lower.match(/(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{3,4}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))/);
+  return m ? m[1].trim() : null;
+}
+
+function parseReminderDateTime(rawInput, tz) {
+  const input = String(rawInput || "").trim();
+  if (!input) return { error: "Missing time." };
+
+  const relativeMs = parseRelativeDurationMs(input);
+  if (relativeMs) {
+    const remindAtMs = Date.now() + relativeMs;
+    return { remindAtMs, displayUtc: formatUTCDateTime(new Date(remindAtMs)), mode: "relative" };
+  }
+
+  const effectiveTz = tz || { type: "offset", offsetMinutes: 0 };
+  const dateToken = extractDateToken(input);
+  const scrubbed = dateToken ? input.replace(dateToken, " ") : input;
+  const timeToken = extractTimeToken(scrubbed);
+  if (!timeToken) return { error: "Missing time." };
+  const timeP = parseTimeParts(timeToken);
+  if (!timeP) return { error: "I couldn't parse the time." };
+  const dateP = dateToken ? parseDateParts(dateToken, effectiveTz) : null;
+  if (dateToken && !dateP) return { error: "I couldn't parse the date." };
+
+  const nowMs = Date.now();
+
+  if (effectiveTz?.type === "iana") {
+    const zone = effectiveTz.zone;
+    const nowUser = DateTime.now().setZone(zone);
+    const targetDate = dateP || { y: nowUser.year, m: nowUser.month, d: nowUser.day };
+    const dt = DateTime.fromObject(
+      { year: targetDate.y, month: targetDate.m, day: targetDate.d, hour: timeP.hh, minute: timeP.mm, second: 0 },
+      { zone }
+    );
+    if (!dt.isValid) return { error: "I couldn't parse that date/time." };
+    if (!dateP && dt.toMillis() <= nowUser.toMillis()) {
+      return { error: "That time has already passed today. Please include a date." };
+    }
+    if (dt.toMillis() <= nowMs) {
+      return { error: "That time is in the past." };
+    }
+    const remindAtMs = dt.toUTC().toMillis();
+    return { remindAtMs, displayUtc: formatUTCDateTime(new Date(remindAtMs)), mode: "absolute" };
+  }
+
+  const nowUser = userNow(effectiveTz);
+  const today = userYMD(effectiveTz);
+  const targetDate = dateP || today;
+  const utcMs = userLocalToUtcMs(targetDate.y, targetDate.m, targetDate.d, timeP.hh, timeP.mm, effectiveTz);
+
+  const reqUser = new Date(nowUser.getTime());
+  reqUser.setUTCFullYear(targetDate.y, targetDate.m - 1, targetDate.d);
+  reqUser.setUTCHours(timeP.hh, timeP.mm, 0, 0);
+
+  if (!dateP && reqUser.getTime() <= nowUser.getTime()) {
+    return { error: "That time has already passed today. Please include a date." };
+  }
+  if (utcMs <= nowMs) {
+    return { error: "That time is in the past." };
+  }
+  return { remindAtMs: utcMs, displayUtc: formatUTCDateTime(new Date(utcMs)), mode: "absolute" };
+}
+
 /**
  * Reservation rules:
  * - now/asap => "—"
@@ -1113,12 +1255,14 @@ const TITLES = [
 
 // userId -> selected title (for modal submit)
 const pendingTitleByUser = new Map(); // userId -> { value,label,description,ts }
+const remindDraftByUser = new Map(); // userId -> { username, titleValue, titleLabel, timeInput, channelId, guildId, ts }
 
 // =====================
 // REMINDERS (in-memory)
 // =====================
 const reminderTimers = new Map(); // rowSerial -> Timeout
 const reminderMeta = new Map(); // rowSerial -> { title, username, channelId, sourceUrl }
+const manualReminderTimers = new Map(); // reminderId -> Timeout
 const MAX_TIMEOUT_MS = 2_147_483_647; // ~24.8 days
 const timersMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
 const reservationsMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
@@ -1171,6 +1315,7 @@ const orphanDeletionCandidates = new Map(); // rowSerial -> { count, firstSeenAt
 const timersStore = readJsonSafe(TIMERS_STORE_PATH, {});
 const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
 const remindersStore = readJsonSafe(REMINDER_STORE_PATH, {});
+const manualReminderStore = readJsonSafe(MANUAL_REMINDER_STORE_PATH, {});
 const DM_CHANNEL_EXPORT_OWNER_ID = "950661965137735710";
 
 for (const [channelId, messageId] of Object.entries(timersStore)) {
@@ -1200,6 +1345,76 @@ function persistReservationsStore() {
 
 function persistRemindersStore() {
   writeJsonSafe(REMINDER_STORE_PATH, remindersStore);
+}
+
+function persistManualRemindersStore() {
+  writeJsonSafe(MANUAL_REMINDER_STORE_PATH, manualReminderStore);
+}
+
+function setManualReminderStoreEntry(key, entry) {
+  manualReminderStore[String(key)] = entry;
+  persistManualRemindersStore();
+}
+
+function clearManualReminderStoreEntry(key) {
+  const id = String(key);
+  if (Object.prototype.hasOwnProperty.call(manualReminderStore, id)) {
+    delete manualReminderStore[id];
+    persistManualRemindersStore();
+  }
+}
+
+function fireManualReminder(client, entry) {
+  if (!entry) return;
+  const targetChannelId = REMINDER_CHANNEL_ID || entry.channelId;
+  if (!targetChannelId) return;
+  client.channels.fetch(targetChannelId)
+    .then((ch) => {
+      if (!ch?.isTextBased()) return;
+      const guardianMention = GUARDIAN_ID ? `<@&${GUARDIAN_ID}>` : "@guardian";
+      const username = String(entry.username || "Username").trim() || "Username";
+      const title = String(entry.title || "Title").trim() || "Title";
+      return ch.send(`${username}, ${title} ${guardianMention}`);
+    })
+    .catch((e) => console.error("manual reminder send failed:", e));
+}
+
+function scheduleManualReminder(client, entry) {
+  if (!entry || !Number.isFinite(entry.remindAtMs)) return;
+  const key = String(entry.id);
+  if (manualReminderTimers.has(key)) {
+    clearTimeout(manualReminderTimers.get(key));
+    manualReminderTimers.delete(key);
+  }
+  const delay = entry.remindAtMs - Date.now();
+  if (delay <= 0) {
+    fireManualReminder(client, entry);
+    clearManualReminderStoreEntry(key);
+    return;
+  }
+  const t = setTimeout(() => {
+    manualReminderTimers.delete(key);
+    fireManualReminder(client, entry);
+    clearManualReminderStoreEntry(key);
+  }, delay);
+  manualReminderTimers.set(key, t);
+}
+
+function rehydrateManualReminders(client) {
+  const now = Date.now();
+  for (const [key, entry] of Object.entries(manualReminderStore)) {
+    const remindAtMs = Number(entry?.remindAtMs);
+    if (!Number.isFinite(remindAtMs)) {
+      clearManualReminderStoreEntry(key);
+      continue;
+    }
+    if (remindAtMs <= now) {
+      fireManualReminder(client, entry);
+      clearManualReminderStoreEntry(key);
+      continue;
+    }
+    scheduleManualReminder(client, { ...entry, id: key });
+  }
 }
 
 function isAllowedDmUser(userId) {
@@ -3280,6 +3495,18 @@ function buildPanelPayload() {
   return { embeds: [embed], components: buildPanelComponents() };
 }
 
+function buildRemindSetupMessage(draft = {}) {
+  const title = draft.titleLabel || draft.titleValue || "—";
+  const username = draft.username || "—";
+  const timeInput = draft.timeInput || "—";
+  return [
+    "Reminder setup (only you can see this):",
+    `Title: ${title}`,
+    `Username: ${username}`,
+    `Time: ${timeInput}`,
+  ].join("\n");
+}
+
 function buildPanelComponents() {
   return [buildTitleSelectRow(), buildPanelActionsRow()];
 }
@@ -3297,6 +3524,63 @@ function buildTitleSelectRow() {
     );
 
   return new ActionRowBuilder().addComponents(select);
+}
+
+function buildRemindTitleSelectRow() {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId("remind_title_select")
+    .setPlaceholder("Choose a reminder title…")
+    .addOptions(
+      TITLES.map((t) => ({
+        label: t.label,
+        description: t.description,
+        value: t.value,
+      }))
+    );
+
+  return new ActionRowBuilder().addComponents(select);
+}
+
+function buildRemindSetupComponents() {
+  return [
+    buildRemindTitleSelectRow(),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("remind_edit_details")
+        .setLabel("Edit Details")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("remind_done")
+        .setLabel("Done")
+        .setStyle(ButtonStyle.Primary)
+    ),
+  ];
+}
+
+function buildRemindDetailsModal(draft = {}) {
+  const modal = new ModalBuilder().setCustomId("remind_details_modal").setTitle("Set Reminder Details");
+
+  const username = new TextInputBuilder()
+    .setCustomId("remind_username")
+    .setLabel("Game Username")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+  if (draft.username) username.setValue(String(draft.username).slice(0, 100));
+
+  const timeInput = new TextInputBuilder()
+    .setCustomId("remind_time")
+    .setLabel("Reminder Time")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setPlaceholder("23:42 or in 1 hour 30 minutes");
+  if (draft.timeInput) timeInput.setValue(String(draft.timeInput).slice(0, 100));
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(username),
+    new ActionRowBuilder().addComponents(timeInput)
+  );
+
+  return modal;
 }
 
 function buildPanelActionsRow() {
@@ -4019,6 +4303,10 @@ const reservationsCommand = new SlashCommandBuilder()
   .setName("reservations")
   .setDescription("Show the next reservation time for each title.");
 
+const remindCommand = new SlashCommandBuilder()
+  .setName("remind")
+  .setDescription("Create a manual reminder.");
+
 const refreshCommand = new SlashCommandBuilder()
   .setName("refresh")
   .setDescription("Force a fresh pull from the sheet and update messages.");
@@ -4039,6 +4327,7 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
     spreadsheetCommand.toJSON(),
     timersCommand.toJSON(),
     reservationsCommand.toJSON(),
+    remindCommand.toJSON(),
     refreshCommand.toJSON(),
     statusCommand.toJSON(),
     perfCommand.toJSON(),
@@ -4077,6 +4366,7 @@ client.once("clientReady", async () => {
     console.error("❌ ensurePanel failed:", e);
   }
   rehydrateReminders(client);
+  rehydrateManualReminders(client);
   startSnapshotRefreshLoop();
 
   for (const [channelId, entry] of timersMessageByChannel.entries()) {
@@ -4578,6 +4868,24 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    // /remind
+    if (interaction.isChatInputCommand() && interaction.commandName === "remind") {
+      remindDraftByUser.set(interaction.user.id, {
+        username: "",
+        titleValue: "",
+        titleLabel: "",
+        timeInput: "",
+        channelId: interaction.channelId,
+        guildId: interaction.guildId,
+        ts: Date.now(),
+      });
+      return interaction.reply({
+        flags: MessageFlags.Ephemeral,
+        content: buildRemindSetupMessage(),
+        components: buildRemindSetupComponents(),
+      });
+    }
+
     // timezone picker select (IANA)
     if (interaction.isStringSelectMenu() && interaction.customId === "select_timezone_iana") {
       const zone = interaction.values?.[0];
@@ -4619,6 +4927,25 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.update({
         content: `✅ Timezone updated: ${tzLabel}.`,
         components: [],
+      });
+    }
+
+    // /remind title select
+    if (interaction.isStringSelectMenu() && interaction.customId === "remind_title_select") {
+      const picked = interaction.values?.[0];
+      const t = TITLES.find((x) => x.value === picked);
+      const existing = remindDraftByUser.get(interaction.user.id) || {};
+      remindDraftByUser.set(interaction.user.id, {
+        ...existing,
+        titleValue: picked || "",
+        titleLabel: t?.label ?? picked ?? "",
+        channelId: interaction.channelId,
+        guildId: interaction.guildId,
+        ts: Date.now(),
+      });
+      return interaction.update({
+        content: buildRemindSetupMessage(remindDraftByUser.get(interaction.user.id)),
+        components: buildRemindSetupComponents(),
       });
     }
 
@@ -4803,6 +5130,25 @@ client.on("interactionCreate", async (interaction) => {
         }
       }, 0);
       return;
+    }
+
+    // /remind details modal submit
+    if (interaction.isModalSubmit() && interaction.customId === "remind_details_modal") {
+      const username = String(interaction.fields.getTextInputValue("remind_username") || "").trim();
+      const timeInput = String(interaction.fields.getTextInputValue("remind_time") || "").trim();
+      const existing = remindDraftByUser.get(interaction.user.id) || {};
+      remindDraftByUser.set(interaction.user.id, {
+        ...existing,
+        username,
+        timeInput,
+        channelId: interaction.channelId || existing.channelId,
+        guildId: interaction.guildId || existing.guildId,
+        ts: Date.now(),
+      });
+      return interaction.reply({
+        flags: MessageFlags.Ephemeral,
+        content: "✅ Details saved. Click Done in the reminder box to set the reminder.",
+      });
     }
 
     // modal submit -> submit -> post in FORM channel
@@ -5063,6 +5409,62 @@ client.on("interactionCreate", async (interaction) => {
         channelId: interaction.channelId,
       });
       return interaction.editReply("✅ Reservation removed.");
+    }
+
+    // /remind edit details -> modal
+    if (interaction.isButton() && interaction.customId === "remind_edit_details") {
+      const draft = remindDraftByUser.get(interaction.user.id) || {};
+      try {
+        return await interaction.showModal(buildRemindDetailsModal(draft));
+      } catch (e) {
+        if (isUnknownInteractionError(e)) return;
+        throw e;
+      }
+    }
+
+    // /remind done
+    if (interaction.isButton() && interaction.customId === "remind_done") {
+      const draft = remindDraftByUser.get(interaction.user.id) || {};
+      const missing = [];
+      if (!String(draft.titleValue || "").trim()) missing.push("Title");
+      if (!String(draft.username || "").trim()) missing.push("Username");
+      if (!String(draft.timeInput || "").trim()) missing.push("Time");
+      if (missing.length) {
+        return interaction.reply({
+          flags: MessageFlags.Ephemeral,
+          content: `❌ Missing: ${missing.join(", ")}.`,
+        });
+      }
+
+      const tz = getUserTimezone(interaction.user.id);
+      const parsed = parseReminderDateTime(draft.timeInput, tz);
+      if (parsed?.error) {
+        return interaction.reply({
+          flags: MessageFlags.Ephemeral,
+          content: `❌ ${parsed.error}`,
+        });
+      }
+
+      const reminderId = `manual_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      const entry = {
+        id: reminderId,
+        remindAtMs: parsed.remindAtMs,
+        channelId: draft.channelId || interaction.channelId,
+        guildId: draft.guildId || interaction.guildId,
+        username: String(draft.username).trim(),
+        title: String(draft.titleLabel || draft.titleValue || "").trim(),
+        createdBy: interaction.user.id,
+        createdAtMs: Date.now(),
+      };
+      setManualReminderStoreEntry(reminderId, entry);
+      scheduleManualReminder(client, entry);
+      remindDraftByUser.delete(interaction.user.id);
+
+      const stamp = Math.floor(parsed.remindAtMs / 1000);
+      return interaction.reply({
+        flags: MessageFlags.Ephemeral,
+        content: `✅ Reminder set for <t:${stamp}:F> (UTC: ${parsed.displayUtc}).`,
+      });
     }
 
     // 🛑 Cancel Remind
