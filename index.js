@@ -2651,15 +2651,30 @@ function renderTimersTextFromSnapshot() {
     const unix = Math.floor((Date.now() + secondsUntil * 1000) / 1000);
     return `<t:${unix}:${style}>`;
   };
+  const formatDuration = (secondsUntil) => {
+    if (!Number.isFinite(secondsUntil)) return null;
+    if (secondsUntil <= 59) return "Available";
+    const mmTotal = Math.floor(secondsUntil / 60);
+    const hh = Math.floor(mmTotal / 60);
+    const mm = mmTotal % 60;
+    return hh > 0 ? `${hh}h ${mm}m` : `${mm}m`;
+  };
   const formatRemaining = (title) => {
     const possible = nextPossibleByTitle.get(title);
-    if (possible && Number.isFinite(possible.secondsUntil)) {
-      if (possible.secondsUntil <= 59) return "Available";
-      const mmTotal = Math.floor(possible.secondsUntil / 60);
-      const hh = Math.floor(mmTotal / 60);
-      const mm = mmTotal % 60;
-      return hh > 0 ? `${hh}h ${mm}m` : `${mm}m`;
+    const possibleSeconds = possible?.secondsUntil;
+    const possibleFormatted = formatDuration(possibleSeconds);
+
+    const nextReservation = nextByTitle.get(title);
+    const nextReservationFormatted = formatDuration(nextReservation?.secondsUntil);
+    if (
+      nextReservationFormatted &&
+      nextReservationFormatted !== "Available" &&
+      (!Number.isFinite(possibleSeconds) || possibleSeconds <= 59)
+    ) {
+      return nextReservationFormatted;
     }
+
+    if (possibleFormatted) return possibleFormatted;
 
     // Fallback for old Apps Script snapshot shape (elapsed-only).
     const elapsedSeconds = byTitle.get(title);
@@ -5909,6 +5924,20 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         await pingChannel.send(`${mention} ${title} is on ${username}! Please refresh your game.`);
+
+        const mainPingChannelId = PING_CHANNEL_ID ? String(PING_CHANNEL_ID) : null;
+        const shouldSendToMain =
+          mainPingChannelId &&
+          mainPingChannelId !== String(targetPingChannelId) &&
+          (originGuildId ? true : false);
+        if (shouldSendToMain) {
+          const mainChannel = await client.channels.fetch(mainPingChannelId);
+          if (mainChannel?.isTextBased()) {
+            await mainChannel.send(`${title} is on ${username}!`);
+          } else {
+            console.error("Main ping channel is not text based:", mainPingChannelId);
+          }
+        }
         auditLog("ping_sent", {
           userId: interaction.user.id,
           rowSerial,
