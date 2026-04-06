@@ -3455,6 +3455,31 @@ function extractDiscordMessageLinkFromUrl(url) {
   if (!match) return null;
   return { channelId: match[2], messageId: match[3] };
 }
+async function updateOriginalRequestFromSourceUrl(client, sourceUrl, rowSerial, completedOverride, showPingOverride) {
+  const link = extractDiscordMessageLinkFromUrl(sourceUrl);
+  if (!link) return false;
+
+  const ch = await client.channels.fetch(link.channelId);
+  if (!ch?.isTextBased()) return false;
+
+  const msg = await ch.messages.fetch(link.messageId);
+  const reservationStr = getReservationFromEmbed(msg);
+  const completed = typeof completedOverride === "boolean" ? completedOverride : getCompletedFromEmbed(msg);
+  const pingUserId = resolvePingUserId(msg, rowSerial);
+  const base = msg.embeds?.[0]
+    ? EmbedBuilder.from(msg.embeds[0])
+    : new EmbedBuilder().setTitle("📋 Title Request");
+  if (completed) {
+    base.setColor(0x777777).setFooter({ text: "Completed" });
+  } else {
+    base.setColor(0x00ff00).setFooter(null);
+  }
+
+  const showPing = typeof showPingOverride === "boolean" ? showPingOverride : !isPingHidden(rowSerial);
+  const updatedRow = buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, showPing);
+  await msg.edit({ embeds: [base], components: [updatedRow] });
+  return true;
+}
 async function updateOriginalRequestFromReminder(client, reminderMessage, rowSerial, completedOverride, showPingOverride) {
   const link = extractDiscordMessageLink(reminderMessage?.content);
   if (!link) return false;
@@ -3837,6 +3862,24 @@ function buildManualReminderCancelRow(reminderId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`manual_remind_cancel:${reminderId}`)
+      .setLabel("Cancel Reminder")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+function buildCustomReminderCancelRow(rowSerial) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`custom_remind_cancel:${rowSerial}`)
+      .setLabel("Cancel Reminder")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+function buildAnnounceReminderCancelRow(rowSerial) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`announce_remind_cancel:${rowSerial}`)
       .setLabel("Cancel Reminder")
       .setStyle(ButtonStyle.Danger)
   );
@@ -5563,10 +5606,27 @@ client.on("interactionCreate", async (interaction) => {
       });
 
       const stamp = Math.floor(parsed.remindAtMs / 1000);
-      return interaction.reply({
+      const reply = await interaction.reply({
         flags: MessageFlags.Ephemeral,
         content: `✅ Reminder set for ${username || draft.username || "Username"} for ${draft.title || "Title"}, <t:${stamp}:F>.`,
       });
+
+      const targetChannelId = REMINDER_CHANNEL_ID || draft.channelId;
+      if (targetChannelId) {
+        try {
+          const ch = await client.channels.fetch(targetChannelId);
+          if (ch?.isTextBased()) {
+            const jump = draft.sourceMessageUrl ? `\n${draft.sourceMessageUrl}` : "";
+            await ch.send({
+              content: `✅ Reminder set for ${username || draft.username || "Username"} for ${draft.title || "Title"}, <t:${stamp}:F>. Row #${rowSerial}${jump}`,
+              components: [buildCustomReminderCancelRow(rowSerial)],
+            });
+          }
+        } catch (e) {
+          console.error("Failed to post remind-in announcement:", e);
+        }
+      }
+      return reply;
     }
 
     // modal submit -> submit -> post in FORM channel
@@ -5953,6 +6013,98 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
+    // custom remind-in cancel (reminder channel announcement)
+    if (interaction.isButton() && interaction.customId.startsWith("custom_remind_cancel:")) {
+      const rowSerial = interaction.customId.slice("custom_remind_cancel:".length);
+      if (!rowSerial) {
+        return interaction.reply({
+          flags: MessageFlags.Ephemeral,
+          content: "⚠️ That reminder no longer exists.",
+        });
+      }
+
+      await interaction.deferUpdate();
+      const metaBeforeCancel = reminderMeta.get(String(rowSerial)) || {};
+      cancelReminder(rowSerial);
+
+      if (metaBeforeCancel?.sourceUrl) {
+        try {
+          await updateOriginalRequestFromSourceUrl(client, metaBeforeCancel.sourceUrl, rowSerial);
+        } catch (e) {
+          console.error("updateOriginalRequestFromSourceUrl error:", e);
+        }
+      }
+
+      try {
+        await interaction.message?.delete?.();
+      } catch {}
+
+      auditLog("remind_cancel", {
+        userId: interaction.user.id,
+        rowSerial,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+        success: true,
+      });
+      return interaction.followUp({
+        flags: MessageFlags.Ephemeral,
+        content: "✅ Reminder cancelled.",
+      });
+    }
+
+    // reminder-channel announce cancel (regular remind)
+    if (interaction.isButton() && interaction.customId.startsWith("announce_remind_cancel:")) {
+      const rowSerial = interaction.customId.slice("announce_remind_cancel:".length);
+      if (!rowSerial) {
+        return interaction.reply({
+          flags: MessageFlags.Ephemeral,
+          content: "⚠️ That reminder no longer exists.",
+        });
+      }
+
+      await interaction.deferUpdate();
+      const metaBeforeCancel = reminderMeta.get(String(rowSerial)) || {};
+      cancelReminder(rowSerial);
+
+      // Clear Remind At in sheet
+      let clearJson = null;
+      try {
+        clearJson = await postToAppsScript({ action: "clear_remind", rowSerial });
+      } catch (e) {
+        console.error("clear_remind -> Apps Script error:", e);
+      }
+      if (clearJson && !clearJson.success) {
+        console.error("clear_remind failed:", clearJson);
+      }
+
+      if (metaBeforeCancel?.sourceUrl) {
+        try {
+          await updateOriginalRequestFromSourceUrl(client, metaBeforeCancel.sourceUrl, rowSerial);
+        } catch (e) {
+          console.error("updateOriginalRequestFromSourceUrl error:", e);
+        }
+      }
+
+      try {
+        await interaction.message?.delete?.();
+      } catch {}
+
+      const cancelMessage = clearJson && clearJson.success
+        ? "✅ Reminder cancelled."
+        : "⚠️ Reminder cancelled, but I couldn't clear the sheet. Check Apps Script logs.";
+      auditLog("remind_cancel", {
+        userId: interaction.user.id,
+        rowSerial,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+        success: !!(clearJson && clearJson.success),
+      });
+      return interaction.followUp({
+        flags: MessageFlags.Ephemeral,
+        content: cancelMessage,
+      });
+    }
+
     // 🕒 Remind In (custom time for no-reservation forms)
     if (interaction.isButton() && interaction.customId.startsWith("remind_in_")) {
       const rowSerial = interaction.customId.split("_")[2];
@@ -6216,6 +6368,23 @@ client.on("interactionCreate", async (interaction) => {
         guildId: interaction.guildId,
         channelId: interaction.channelId,
       });
+
+      const stamp = Math.floor(reservationUtc.getTime() / 1000);
+      const targetChannelId = REMINDER_CHANNEL_ID || interaction.channelId;
+      if (targetChannelId) {
+        try {
+          const ch = await client.channels.fetch(targetChannelId);
+          if (ch?.isTextBased()) {
+            const jump = interaction.message?.url ? `\n${interaction.message.url}` : "";
+            await ch.send({
+              content: `✅ Reminder set for ${username} for ${title}, <t:${stamp}:F>. Row #${rowSerial}${jump}`,
+              components: [buildAnnounceReminderCancelRow(rowSerial)],
+            });
+          }
+        } catch (e) {
+          console.error("Failed to post remind announcement:", e);
+        }
+      }
 
       return interaction.editReply(`✅ Reminder armed for **${reservationStr}** (UTC).`);
     }
