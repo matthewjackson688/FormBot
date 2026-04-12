@@ -50,6 +50,7 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  PermissionFlagsBits,
   MessageFlags,
 } = require("discord.js");
 
@@ -2047,18 +2048,35 @@ function startTimersInterval(client, channelId, messageId) {
 
 function parseReservationUTC(resStr) {
   if (!resStr || typeof resStr !== "string") return null;
-  const m = resStr.trim().match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (!m) return null;
+  const raw = resStr.trim();
+  const hmFirst = raw.match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (hmFirst) {
+    const hh = Number(hmFirst[1]);
+    const mm = Number(hmFirst[2]);
+    const dd = Number(hmFirst[3]);
+    const MM = Number(hmFirst[4]);
+    const yyyy = Number(hmFirst[5]);
+    const utcMs = Date.UTC(yyyy, MM - 1, dd, hh, mm, 0, 0);
+    if (Number.isFinite(utcMs)) return new Date(utcMs);
+  }
 
-  const hh = Number(m[1]);
-  const mm = Number(m[2]);
-  const dd = Number(m[3]);
-  const MM = Number(m[4]);
-  const yyyy = Number(m[5]);
+  const dateFirst = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})$/);
+  if (dateFirst) {
+    let dd = Number(dateFirst[1]);
+    let MM = Number(dateFirst[2]);
+    const yyyy = Number(dateFirst[3]);
+    const hh = Number(dateFirst[4]);
+    const mm = Number(dateFirst[5]);
+    if (MM > 12 && dd <= 12) {
+      const swap = dd;
+      dd = MM;
+      MM = swap;
+    }
+    const utcMs = Date.UTC(yyyy, MM - 1, dd, hh, mm, 0, 0);
+    if (Number.isFinite(utcMs)) return new Date(utcMs);
+  }
 
-  const utcMs = Date.UTC(yyyy, MM - 1, dd, hh, mm, 0, 0);
-  if (!Number.isFinite(utcMs)) return null;
-  return new Date(utcMs);
+  return null;
 }
 
 function normalizeReservationDisplay(value) {
@@ -2560,6 +2578,9 @@ function shouldHideReservationFromCheck(item, nowMs) {
   if (!Number.isFinite(nowMs)) return false;
   const HIDE_AFTER_MS = 24 * 60 * 60 * 1000;
 
+  const doneRaw = item.done ?? item.Done ?? item["Done"];
+  if (parseBool(doneRaw)) return true;
+
   const reservationRaw =
     item.reservationUtc ??
     item.reservationsUtc ??
@@ -2582,6 +2603,16 @@ function shouldHideReservationFromCheck(item, nowMs) {
   const reservationMs = parseAnyTimestampMs(reservationRaw);
   if (!Number.isFinite(reservationMs)) return false;
   return nowMs - reservationMs >= HIDE_AFTER_MS;
+}
+
+function mergeReservationForCheck(item, rowState) {
+  if (!item || typeof item !== "object") return item;
+  if (!rowState || typeof rowState !== "object") return item;
+  const merged = { ...item };
+  if (!merged.reservationUtc && rowState.reservationUtc) merged.reservationUtc = rowState.reservationUtc;
+  if (!merged.madeAtUtc && rowState.madeAtUtc) merged.madeAtUtc = rowState.madeAtUtc;
+  if (merged.done == null && rowState.done != null) merged.done = rowState.done;
+  return merged;
 }
 
 function getReservationUsername(item) {
@@ -4662,6 +4693,12 @@ const listCommand = new SlashCommandBuilder()
   .setName("list")
   .setDescription("List outstanding reminders that haven't fired yet.");
 
+const purgeCommand = new SlashCommandBuilder()
+  .setName("purge")
+  .setDescription("Admin: purge stored reservation mappings and reminders.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .setDMPermission(false);
+
 const refreshCommand = new SlashCommandBuilder()
   .setName("refresh")
   .setDescription("Force a fresh pull from the sheet and update messages.");
@@ -4684,6 +4721,7 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
     reservationsCommand.toJSON(),
     remindCommand.toJSON(),
     listCommand.toJSON(),
+    purgeCommand.toJSON(),
     refreshCommand.toJSON(),
     statusCommand.toJSON(),
     perfCommand.toJSON(),
@@ -5275,6 +5313,45 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
+    // /purge
+    if (interaction.isChatInputCommand() && interaction.commandName === "purge") {
+      if (!interaction.memberPermissions?.has("Administrator")) {
+        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "❌ You need Administrator to use this." });
+      }
+
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      } catch (e) {
+        if (isUnknownInteractionError(e)) return;
+        throw e;
+      }
+
+      const ownersCount = reservationOwners.size;
+      const messagesCount = reservationMessages.size;
+      const reminderMetaCount = reminderMeta.size;
+      const reminderStoreCount = Object.keys(remindersStore).length;
+
+      for (const t of reminderTimers.values()) clearTimeout(t);
+      reminderTimers.clear();
+      reminderMeta.clear();
+      for (const key of Object.keys(remindersStore)) delete remindersStore[key];
+      persistRemindersStore();
+
+      reservationOwners.clear();
+      persistReservationOwners();
+      reservationMessages.clear();
+      persistReservationMessages();
+      orphanDeletionCandidates.clear();
+
+      return interaction.editReply(
+        `✅ Purged mappings and reminders.\n` +
+          `Owners cleared: ${ownersCount}\n` +
+          `Messages cleared: ${messagesCount}\n` +
+          `Reminder meta cleared: ${reminderMetaCount}\n` +
+          `Reminder store cleared: ${reminderStoreCount}`
+      );
+    }
+
     // timezone picker select (IANA)
     if (interaction.isStringSelectMenu() && interaction.customId === "select_timezone_iana") {
       const zone = interaction.values?.[0];
@@ -5370,18 +5447,20 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`❌ Could not fetch reservations${js?.message ? `: ${js.message}` : "."}`);
       }
 
-      const allItems = Array.isArray(js.reservations) ? js.reservations : [];
-      const nowMs = Date.now();
-      const items = allItems.filter((r) => {
-        const serial = r?.serial ?? r?.row;
-        if (getReservationOwner(serial) !== discordId) return false;
-        return !shouldHideReservationFromCheck(r, nowMs);
-      });
       const rowStateBySerial = new Map(
         (Array.isArray(timersSnapshot?.rowStates) ? timersSnapshot.rowStates : [])
           .map((rowState) => [String(rowState?.serial || ""), rowState])
           .filter(([serial]) => !!serial)
       );
+      const allItems = Array.isArray(js.reservations) ? js.reservations : [];
+      const nowMs = Date.now();
+      const items = allItems.filter((r) => {
+        const serial = r?.serial ?? r?.row;
+        if (getReservationOwner(serial) !== discordId) return false;
+        const rowState = rowStateBySerial.get(String(serial));
+        const merged = mergeReservationForCheck(r, rowState);
+        return !shouldHideReservationFromCheck(merged, nowMs);
+      });
       for (const item of items) {
         const serial = String(item?.serial ?? item?.row ?? "");
         if (!serial) continue;
