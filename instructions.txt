@@ -1,0 +1,7 @@
+sudo ssh -i "/home/matthew/Documents/Bots/FormBot_1056/ssh-key.key" ubuntu@145.241.245.105
+cd FormBot
+
+git pull
+pm2 restart 0
+
+reminderbot replacement
