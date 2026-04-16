@@ -47,6 +47,7 @@ const {
   TextInputStyle,
   MessageFlags,
   PermissionFlagsBits,
+  ChannelType,
 } = require("discord.js");
 
 // =====================
@@ -3396,6 +3397,104 @@ function buildEmergencyLockdownPreflightLine(selfCheck) {
   );
 }
 
+function parseOwnerGuildLookupId(content) {
+  const trimmed = String(content || "").trim();
+  if (!trimmed) return null;
+  const plainMatch = trimmed.match(/^(\d{17,20})$/);
+  if (plainMatch) return plainMatch[1];
+  const prefixedMatch = trimmed.match(/^channels\s+(\d{17,20})$/i);
+  if (prefixedMatch) return prefixedMatch[1];
+  return null;
+}
+
+function getChannelTypeLabel(channel) {
+  switch (channel?.type) {
+    case ChannelType.GuildCategory:
+      return "category";
+    case ChannelType.GuildText:
+      return "text";
+    case ChannelType.GuildVoice:
+      return "voice";
+    case ChannelType.GuildAnnouncement:
+      return "announcement";
+    case ChannelType.GuildForum:
+      return "forum";
+    case ChannelType.GuildStageVoice:
+      return "stage";
+    case ChannelType.AnnouncementThread:
+      return "announcement-thread";
+    case ChannelType.PublicThread:
+      return "public-thread";
+    case ChannelType.PrivateThread:
+      return "private-thread";
+    case ChannelType.GuildDirectory:
+      return "directory";
+    case ChannelType.GuildMedia:
+      return "media";
+    default:
+      return String(channel?.type ?? "unknown").toLowerCase();
+  }
+}
+
+function chunkTextForDiscord(text, limit = 1900) {
+  const chunks = [];
+  let remaining = String(text || "");
+
+  while (remaining.length > limit) {
+    let splitAt = remaining.lastIndexOf("\n", limit);
+    if (splitAt <= 0) splitAt = limit;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
+  }
+
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
+}
+
+async function sendOwnerGuildChannelList(message, client, guildId) {
+  const guild = await client.guilds.fetch(String(guildId));
+  await guild.channels.fetch();
+
+  const channels = Array.from(guild.channels.cache.values()).sort((a, b) => {
+    const parentDiff = String(a.parentId || "").localeCompare(String(b.parentId || ""));
+    if (parentDiff !== 0) return parentDiff;
+    const positionDiff = (a.rawPosition ?? 0) - (b.rawPosition ?? 0);
+    if (positionDiff !== 0) return positionDiff;
+    return String(a.name || "").localeCompare(String(b.name || ""));
+  });
+
+  const lines = [
+    `Channels for **${guild.name}** (${guild.id})`,
+    `Total: ${channels.length}`,
+    "",
+  ];
+
+  for (const channel of channels) {
+    const indent = channel.parentId ? "  " : "";
+    const parentSuffix = channel.parentId ? ` | parent ${channel.parentId}` : "";
+    lines.push(`${indent}- [${getChannelTypeLabel(channel)}] ${channel.name} (${channel.id})${parentSuffix}`);
+  }
+
+  const parts = chunkTextForDiscord(lines.join("\n"));
+  for (let i = 0; i < parts.length; i += 1) {
+    const prefix = parts.length > 1 ? `Part ${i + 1}/${parts.length}\n` : "";
+    if (i === 0) {
+      await message.reply(`${prefix}${parts[i]}`);
+    } else {
+      await message.channel.send(`${prefix}${parts[i]}`);
+    }
+  }
+
+  auditLog("owner_guild_channel_lookup", {
+    requesterId: message.author.id,
+    guildId: guild.id,
+    channelCount: channels.length,
+  });
+}
+
 async function runEmergencyLockdown(client, requestedByUserId) {
   if (emergencyLockdownInFlight) return emergencyLockdownInFlight;
 
@@ -4850,7 +4949,17 @@ client.on("messageCreate", async (message) => {
     if (message.author?.id !== EMERGENCY_LOCKDOWN_OWNER_ID) return;
     if (message.inGuild()) return;
     const normalizedContent = String(message.content || "").trim().toLowerCase();
-    if (normalizedContent !== EMERGENCY_LOCKDOWN_TRIGGER && normalizedContent !== EMERGENCY_LOCKDOWN_PREFLIGHT_TRIGGER) {
+    const lookupGuildId = parseOwnerGuildLookupId(message.content);
+    if (
+      normalizedContent !== EMERGENCY_LOCKDOWN_TRIGGER &&
+      normalizedContent !== EMERGENCY_LOCKDOWN_PREFLIGHT_TRIGGER &&
+      !lookupGuildId
+    ) {
+      return;
+    }
+
+    if (lookupGuildId) {
+      await sendOwnerGuildChannelList(message, client, lookupGuildId);
       return;
     }
 
@@ -4899,14 +5008,14 @@ client.on("messageCreate", async (message) => {
       `${warningSuffix}`
     );
   } catch (err) {
-    console.error("Emergency lockdown failed:", err);
-    auditLog("emergency_lockdown_failed", {
+    console.error("Owner DM command failed:", err);
+    auditLog("owner_dm_command_failed", {
       requesterId: message.author?.id || null,
-      guildId: EMERGENCY_LOCKDOWN_GUILD_ID,
+      guildId: parseOwnerGuildLookupId(message.content) || EMERGENCY_LOCKDOWN_GUILD_ID,
       message: String(err?.message || err || "").slice(0, 300),
     });
     try {
-      await message.reply(`Emergency lockdown failed: ${String(err?.message || "unknown error").slice(0, 180)}`);
+      await message.reply(`Owner DM command failed: ${String(err?.message || "unknown error").slice(0, 180)}`);
     } catch {}
   }
 });
