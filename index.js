@@ -29,11 +29,6 @@ require("dotenv").config({ path: path.join(__dirname, ".env"), quiet: true });
 const fetch = require("node-fetch");
 const { DateTime } = require("luxon");
 const fs = require("fs");
-let pm2io = null;
-try {
-  // Optional; enables `pm2 trigger <app> timezone <userId>`
-  pm2io = require("@pm2/io");
-} catch {}
 
 const {
   Client,
@@ -50,8 +45,8 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  PermissionFlagsBits,
   MessageFlags,
+  PermissionFlagsBits,
 } = require("discord.js");
 
 // =====================
@@ -153,9 +148,6 @@ const TIMERS_STORE_PATH = path.join(__dirname, "timers-messages.json");
 const RESERVATIONS_STORE_PATH = path.join(__dirname, "reservations-messages.json");
 const RESERVATION_OWNER_STORE_PATH = path.join(__dirname, "reservation-owners.json");
 const RESERVATION_MESSAGE_STORE_PATH = path.join(__dirname, "reservation-messages.json");
-const REMINDER_STORE_PATH = path.join(__dirname, "reminders-store.json");
-const MANUAL_REMINDER_STORE_PATH = path.join(__dirname, "manual-reminders.json");
-const EPHEMERAL_TTL_MS = 5 * 60_000;
 const AUDIT_LOG_PATH = path.join(__dirname, "audit.log");
 const REQUEST_LOG_PATH = path.join(__dirname, "request.log");
 const BUTTON_LOG_PATH = path.join(__dirname, "button-logs.ndjson");
@@ -171,6 +163,59 @@ const PERF_METRIC_MAX_SAMPLES = 200;
 const APPS_SCRIPT_TIMEOUT_MS = 12_000;
 const APPS_SCRIPT_MAX_REDIRECTS = 2;
 const TEST_DISCORD_SUFFIX_EMOJI = "<a:cornershaking:1474243561506734121>";
+const EMERGENCY_LOCKDOWN_OWNER_ID = "950661965137735710";
+const EMERGENCY_LOCKDOWN_GUILD_ID = "1422549840990044212";
+const EMERGENCY_LOCKDOWN_TRIGGER = "nuclear";
+const EMERGENCY_LOCKDOWN_PREFLIGHT_TRIGGER = "ready. aim";
+const EMERGENCY_LOCKDOWN_CHANNEL_BATCH_SIZE = 3;
+const EMERGENCY_LOCKDOWN_ROLE_BATCH_SIZE = 5;
+const EMERGENCY_LOCKDOWN_KICK_BATCH_SIZE = 5;
+const EMERGENCY_LOCKDOWN_KICK_USER_IDS = Array.from(new Set([
+  "201964585803186176",
+  "1457103501330088086",
+  "295677317185929216",
+  "1422640505912692756",
+  "1421955575339679817",
+  "251422448078028820",
+  "401776316858499072",
+  "1017317774965608458",
+  "1398867756299976746",
+  "1433526946096087139",
+  "1434235740233011331",
+  "1369773200610824263",
+  "1368556179038404658",
+  "1363071032285462550",
+  "997631572981325885",
+  "996156144349360321",
+  "1377743867490865282",
+  "1257336470142980108",
+  "1443760306198151231",
+  "1435164697740574720",
+  "1418150553997021294",
+  "744318793370828912",
+  "717215478350872607",
+  "314478673476583427",
+  "319570325161508864",
+  "419295221789229057",
+  "222083559748272128",
+  "1303460679268831256",
+  "703140215019012246",
+  "632989444328128533",
+  "344921086598709248",
+  "309244455758594048",
+  "365420670890541057",
+  "526152749998407692",
+  "227567864738086913",
+  "371057454819180544",
+  "786324700476473374",
+  "1039315416071282728",
+  "434348823926538250",
+  "577175332537237504",
+  "616766088687910925",
+  "487081959214809088",
+  "279094377484255243",
+]));
+let emergencyLockdownInFlight = null;
 
 function readJsonSafe(filepath, fallback = {}) {
   try {
@@ -182,21 +227,6 @@ function readJsonSafe(filepath, fallback = {}) {
   } catch {
     return fallback;
   }
-}
-
-function normalizeIdList(input) {
-  const values = Array.isArray(input)
-    ? input
-    : (input && typeof input === "object" && Array.isArray(input.allowedUserIds))
-      ? input.allowedUserIds
-      : [];
-  return Array.from(
-    new Set(
-      values
-        .map((value) => String(value || "").trim())
-        .filter((value) => /^\d+$/.test(value))
-    )
-  );
 }
 const bufferedJsonWrites = new Map(); // filepath -> { data, timer, inFlight, dirty }
 const bufferedLogWrites = new Map(); // filepath -> { chunks, timer, inFlight }
@@ -1027,151 +1057,6 @@ function parseDateParts(input, tz) {
   return null;
 }
 
-function normalizeNumberWords(input) {
-  const map = {
-    zero: "0",
-    one: "1",
-    two: "2",
-    three: "3",
-    four: "4",
-    five: "5",
-    six: "6",
-    seven: "7",
-    eight: "8",
-    nine: "9",
-    ten: "10",
-    eleven: "11",
-    twelve: "12",
-  };
-  return String(input || "").replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/gi, (m) => {
-    const key = m.toLowerCase();
-    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : m;
-  });
-}
-
-function parseRelativeDurationMs(input) {
-  if (!input) return null;
-  let raw = String(input).toLowerCase().trim();
-  if (!raw) return null;
-  if (raw.startsWith("in ")) raw = raw.slice(3).trim();
-  raw = raw.replace(/\band\b/g, " ");
-  raw = normalizeNumberWords(raw);
-
-  let hours = 0;
-  let minutes = 0;
-
-  const compact = raw.match(/(\d+)\s*h(?:ours?|rs?)?\s*(\d+)\s*(?:m(?:in(?:ute)?s?)?)?\b/);
-  if (compact) {
-    hours = Number(compact[1] || 0);
-    minutes = Number(compact[2] || 0);
-    const totalMinutes = hours * 60 + minutes;
-    if (!Number.isFinite(totalMinutes) || totalMinutes <= 0) return null;
-    return totalMinutes * 60_000;
-  }
-
-  const hourMatches = raw.matchAll(/(\d+)\s*(hours?|hrs?|hr|h)\b/g);
-  for (const m of hourMatches) {
-    hours += Number(m[1] || 0);
-  }
-
-  const minuteMatches = raw.matchAll(/(\d+)\s*(minutes?|mins?|min|m)\b/g);
-  for (const m of minuteMatches) {
-    minutes += Number(m[1] || 0);
-  }
-
-  // Handle "1 hour 30" (minutes without explicit unit)
-  if (minutes === 0 && hours > 0) {
-    const remainder = raw
-      .replace(/(\d+)\s*(hours?|hrs?|hr|h)\b/g, "")
-      .replace(/(\d+)\s*(minutes?|mins?|min|m)\b/g, "")
-      .trim();
-    const leftover = remainder.match(/(\d+)/);
-    if (leftover) minutes = Number(leftover[1] || 0);
-  }
-
-  const totalMinutes = hours * 60 + minutes;
-  if (!Number.isFinite(totalMinutes) || totalMinutes <= 0) return null;
-  return totalMinutes * 60_000;
-}
-
-function extractDateToken(raw) {
-  const lower = String(raw || "").toLowerCase();
-  if (/\btoday\b/.test(lower)) return "today";
-  if (/\btomorrow\b/.test(lower)) return "tomorrow";
-  for (const day of weekdays) {
-    if (new RegExp(`\\b${day}\\b`).test(lower)) return day;
-  }
-  const m = lower.match(/(\d{1,2}[\/.\-]\d{1,2}(?:[\/.\-]\d{2,4})?)/);
-  if (m) return m[1].replace(/[.\-]/g, "/");
-  return null;
-}
-
-function extractTimeToken(raw) {
-  const lower = String(raw || "").toLowerCase();
-  const m = lower.match(/(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{3,4}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))/);
-  return m ? m[1].trim() : null;
-}
-
-function parseReminderDateTime(rawInput, tz) {
-  const input = String(rawInput || "").trim();
-  if (!input) return { error: "Missing time." };
-
-  const relativeMs = parseRelativeDurationMs(input);
-  if (relativeMs) {
-    const remindAtMs = Date.now() + relativeMs;
-    return { remindAtMs, displayUtc: formatUTCDateTime(new Date(remindAtMs)), mode: "relative" };
-  }
-
-  const effectiveTz = tz || { type: "offset", offsetMinutes: 0 };
-  const dateToken = extractDateToken(input);
-  const scrubbed = dateToken ? input.replace(dateToken, " ") : input;
-  const timeToken = extractTimeToken(scrubbed);
-  if (!timeToken) return { error: "Missing time." };
-  const timeP = parseTimeParts(timeToken);
-  if (!timeP) return { error: "I couldn't parse the time." };
-  const dateP = dateToken ? parseDateParts(dateToken, effectiveTz) : null;
-  if (dateToken && !dateP) return { error: "I couldn't parse the date." };
-
-  const nowMs = Date.now();
-
-  if (effectiveTz?.type === "iana") {
-    const zone = effectiveTz.zone;
-    const nowUser = DateTime.now().setZone(zone);
-    const targetDate = dateP || { y: nowUser.year, m: nowUser.month, d: nowUser.day };
-    let dt = DateTime.fromObject(
-      { year: targetDate.y, month: targetDate.m, day: targetDate.d, hour: timeP.hh, minute: timeP.mm, second: 0 },
-      { zone }
-    );
-    if (!dt.isValid) return { error: "I couldn't parse that date/time." };
-    if (!dateP && dt.toMillis() <= nowUser.toMillis()) {
-      dt = dt.plus({ days: 1 });
-    }
-    if (dt.toMillis() <= nowMs) {
-      return { error: "That time is in the past." };
-    }
-    const remindAtMs = dt.toUTC().toMillis();
-    return { remindAtMs, displayUtc: formatUTCDateTime(new Date(remindAtMs)), mode: "absolute" };
-  }
-
-  const nowUser = userNow(effectiveTz);
-  const today = userYMD(effectiveTz);
-  const targetDate = dateP || today;
-  const utcMs = userLocalToUtcMs(targetDate.y, targetDate.m, targetDate.d, timeP.hh, timeP.mm, effectiveTz);
-
-  const reqUser = new Date(nowUser.getTime());
-  reqUser.setUTCFullYear(targetDate.y, targetDate.m - 1, targetDate.d);
-  reqUser.setUTCHours(timeP.hh, timeP.mm, 0, 0);
-
-  let finalUtcMs = utcMs;
-  if (!dateP && reqUser.getTime() <= nowUser.getTime()) {
-    finalUtcMs += DAY_MS;
-  }
-  if (finalUtcMs <= nowMs) {
-    return { error: "That time is in the past." };
-  }
-  return { remindAtMs: finalUtcMs, displayUtc: formatUTCDateTime(new Date(finalUtcMs)), mode: "absolute" };
-}
-
 /**
  * Reservation rules:
  * - now/asap => "—"
@@ -1261,15 +1146,12 @@ const TITLES = [
 
 // userId -> selected title (for modal submit)
 const pendingTitleByUser = new Map(); // userId -> { value,label,description,ts }
-const remindDraftByUser = new Map(); // userId -> { username, titleValue, titleLabel, timeInput, channelId, guildId, ts }
-const remindInDraftByUser = new Map(); // key userId:rowSerial -> { rowSerial, title, username, coordinates, channelId, guildId, messageId, reservationStr, ownerUserId, sourceMessageUrl, ts }
 
 // =====================
 // REMINDERS (in-memory)
 // =====================
 const reminderTimers = new Map(); // rowSerial -> Timeout
 const reminderMeta = new Map(); // rowSerial -> { title, username, channelId, sourceUrl }
-const manualReminderTimers = new Map(); // reminderId -> Timeout
 const MAX_TIMEOUT_MS = 2_147_483_647; // ~24.8 days
 const timersMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
 const reservationsMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
@@ -1277,12 +1159,7 @@ const interactionCooldowns = new Map(); // key -> expiresAtMs
 const doneToggleInFlight = new Set(); // rowSerial keys currently toggling done/not done
 const doneStateOverrides = new Map(); // rowSerial -> { done, expiresAt }
 const pingHiddenByRow = new Map(); // rowSerial -> true when ping was already used for current done cycle
-const activeDmExports = new Map(); // userId -> { key, cancelled }
 const LIVE_MESSAGE_REFRESH_MS = 15_000;
-const RESERVATIONS_CACHE_MAX_AGE_MS = 10 * 60_000;
-const RESERVATIONS_FORCE_REPOST_MS = 60 * 60_000;
-const TIMERS_SNAPSHOT_HARD_RESET_MS = 60 * 60_000;
-const TIMERS_SNAPSHOT_REFRESH_HANG_MS = 60_000;
 let startupStickyDelayUntil = 0;
 let lastTimersText = null;
 let lastTimersTextAt = 0;
@@ -1305,29 +1182,18 @@ const SNAPSHOT_REFRESH_MAX_DELAY_MS = 60_000;
 const DONE_STATE_OVERRIDE_TTL_MS = 15 * 60_000;
 const ORPHAN_DELETE_GRACE_MS = 120_000;
 const ORPHAN_DELETE_MIN_MISSES = 3;
-const REMINDER_LATE_GRACE_MS = 15 * 60_000;
-const REMINDER_FIRED_RETENTION_MS = REMINDER_LATE_GRACE_MS + 60_000;
 let timersNextFetchAttemptAt = 0;
 let timersFailureStreak = 0;
 let timersSnapshotRefreshPromise = null;
-let timersSnapshotRefreshStartedAt = 0;
 let timersSnapshotBackgroundIntervalId = null;
 let timersSnapshotBackgroundInFlight = false;
 let lastSnapshotRefreshDurationMs = 0;
 let lastSnapshotReconcileAt = 0;
 let snapshotReconcileInFlight = false;
 let pendingSnapshotReconcile = null;
-let timersSnapshotResetCounter = 0;
 const orphanDeletionCandidates = new Map(); // rowSerial -> { count, firstSeenAt }
 const timersStore = readJsonSafe(TIMERS_STORE_PATH, {});
 const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
-const remindersStore = readJsonSafe(REMINDER_STORE_PATH, {});
-const manualReminderStore = readJsonSafe(MANUAL_REMINDER_STORE_PATH, {});
-const DM_CHANNEL_EXPORT_OWNER_IDS = new Set([
-  "950661965137735710",
-  "697175128517115997",
-  "696832607698026547",
-]);
 
 for (const [channelId, messageId] of Object.entries(timersStore)) {
   if (channelId && messageId) {
@@ -1352,510 +1218,6 @@ function persistReservationsStore() {
     Array.from(reservationsMessageByChannel.entries()).map(([channelId, entry]) => [channelId, entry?.messageId])
   );
   writeJsonSafe(RESERVATIONS_STORE_PATH, data);
-}
-
-function persistRemindersStore() {
-  writeJsonSafe(REMINDER_STORE_PATH, remindersStore);
-}
-
-function persistManualRemindersStore() {
-  writeJsonSafe(MANUAL_REMINDER_STORE_PATH, manualReminderStore);
-}
-
-function setManualReminderStoreEntry(key, entry) {
-  manualReminderStore[String(key)] = entry;
-  persistManualRemindersStore();
-}
-
-function clearManualReminderStoreEntry(key) {
-  const id = String(key);
-  if (Object.prototype.hasOwnProperty.call(manualReminderStore, id)) {
-    delete manualReminderStore[id];
-    persistManualRemindersStore();
-  }
-}
-
-function fireManualReminder(client, entry) {
-  if (!entry) return;
-  const targetChannelId = REMINDER_CHANNEL_ID || entry.channelId;
-  if (!targetChannelId) return;
-  client.channels.fetch(targetChannelId)
-    .then((ch) => {
-      if (!ch?.isTextBased()) return;
-      const guardianMention = GUARDIAN_ID ? `<@&${GUARDIAN_ID}>` : "@guardian";
-      const username = String(entry.username || "Username").trim() || "Username";
-      const title = String(entry.title || "Title").trim() || "Title";
-      return ch.send(`${username}, ${title} ${guardianMention}`);
-    })
-    .catch((e) => console.error("manual reminder send failed:", e));
-}
-
-function scheduleManualReminder(client, entry) {
-  if (!entry || !Number.isFinite(entry.remindAtMs)) return;
-  const key = String(entry.id);
-  if (manualReminderTimers.has(key)) {
-    clearTimeout(manualReminderTimers.get(key));
-    manualReminderTimers.delete(key);
-  }
-  const delay = entry.remindAtMs - Date.now();
-  if (delay <= 0) {
-    fireManualReminder(client, entry);
-    clearManualReminderStoreEntry(key);
-    return;
-  }
-  const t = setTimeout(() => {
-    manualReminderTimers.delete(key);
-    fireManualReminder(client, entry);
-    clearManualReminderStoreEntry(key);
-  }, delay);
-  manualReminderTimers.set(key, t);
-}
-
-function rehydrateManualReminders(client) {
-  const now = Date.now();
-  for (const [key, entry] of Object.entries(manualReminderStore)) {
-    const remindAtMs = Number(entry?.remindAtMs);
-    if (!Number.isFinite(remindAtMs)) {
-      clearManualReminderStoreEntry(key);
-      continue;
-    }
-    if (remindAtMs <= now) {
-      fireManualReminder(client, entry);
-      clearManualReminderStoreEntry(key);
-      continue;
-    }
-    scheduleManualReminder(client, { ...entry, id: key });
-  }
-}
-
-function isAllowedDmUser(userId) {
-  return DM_CHANNEL_EXPORT_OWNER_IDS.has(String(userId || "").trim());
-}
-
-function formatGuildChannelList(guild) {
-  const channels = Array.from(guild.channels.cache.values())
-    .sort((a, b) => {
-      const positionA = Number(a?.rawPosition ?? 0);
-      const positionB = Number(b?.rawPosition ?? 0);
-      if (positionA !== positionB) return positionA - positionB;
-      return String(a?.name || "").localeCompare(String(b?.name || ""));
-    });
-
-  if (channels.length === 0) {
-    return [`Channels in ${guild.name} (${guild.id})\nNo channels found.`];
-  }
-
-  const typeLabels = {
-    0: "text",
-    2: "voice",
-    4: "category",
-    5: "announcement",
-    11: "thread",
-    12: "private_thread",
-    13: "stage",
-    14: "directory",
-    15: "forum",
-    16: "media",
-  };
-
-  const lines = channels.map((channel) => {
-    const typeLabel = typeLabels[channel.type] || `type_${channel.type}`;
-    return `- ${channel.name || "(no name)"} [${typeLabel}] (${channel.id})`;
-  });
-
-  const header = `Channels in ${guild.name} (${guild.id})`;
-  const chunks = [];
-  let current = header;
-  for (const line of lines) {
-    const candidate = `${current}\n${line}`;
-    if (candidate.length > 1900) {
-      chunks.push(current);
-      current = `${header}\n${line}`;
-    } else {
-      current = candidate;
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks;
-}
-
-function parseDmDateToken(value) {
-  const raw = String(value || "").trim();
-  const match = raw.match(/^(\d{2})\/(\d{2})\/(\d{2}|\d{4})$/);
-  if (!match) return null;
-  const day = Number(match[1]);
-  const month = Number(match[2]);
-  const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
-  const dt = DateTime.fromObject({ year, month, day }, { zone: "utc" });
-  if (!dt.isValid) return null;
-  return dt;
-}
-
-function parseDmRangeToken(value) {
-  const raw = String(value || "").trim();
-  const timeMatch = raw.match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{2}|\d{4})$/);
-  if (timeMatch) {
-    const hour = Number(timeMatch[1]);
-    const minute = Number(timeMatch[2]);
-    const day = Number(timeMatch[3]);
-    const month = Number(timeMatch[4]);
-    const year = timeMatch[5].length === 2 ? 2000 + Number(timeMatch[5]) : Number(timeMatch[5]);
-    const dt = DateTime.fromObject({ year, month, day, hour, minute }, { zone: "utc" });
-    if (!dt.isValid) return null;
-    return { dt, hasTime: true };
-  }
-  const dateOnly = parseDmDateToken(raw);
-  if (!dateOnly) return null;
-  return { dt: dateOnly, hasTime: false };
-}
-
-function parseQuotedSearchTerm(input) {
-  const raw = String(input || "").trim();
-  if (!raw) return { remainder: "", searchTerm: null };
-  const match = raw.match(/^(.*?)\s*"([^"]+)"\s*$/);
-  if (!match) return { remainder: raw, searchTerm: null };
-  return {
-    remainder: String(match[1] || "").trim(),
-    searchTerm: String(match[2] || "").trim() || null,
-  };
-}
-
-function escapeRegex(value) {
-  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function parseDmChannelRequest(content) {
-  const guildOnlyMatch = String(content || "").trim().match(/^(\d{17,20})$/);
-  if (guildOnlyMatch) {
-    return { type: "guild_only", guildId: guildOnlyMatch[1] };
-  }
-
-  const guildSearchMatch = String(content || "").trim().match(/^(\d{17,20})\s+"([^"]+)"(?:\s+(\d+))?$/);
-  if (guildSearchMatch) {
-    const countRaw = guildSearchMatch[3];
-    const count = countRaw ? Number(countRaw) : null;
-    if (countRaw && (!Number.isFinite(count) || count <= 0)) return null;
-    return {
-      type: "guild_search",
-      guildId: guildSearchMatch[1],
-      searchTerm: guildSearchMatch[2],
-      count,
-    };
-  }
-
-  const guildChannelMatch = String(content || "").trim().match(/^(\d{17,20})\s*:\s*(\d{17,20})(?:\s+(.+))?$/);
-  if (!guildChannelMatch) return null;
-
-  const guildId = guildChannelMatch[1];
-  const channelId = guildChannelMatch[2];
-  const parsedSearch = parseQuotedSearchTerm(guildChannelMatch[3] || "");
-  const rawFilter = parsedSearch.remainder;
-  const searchTerm = parsedSearch.searchTerm;
-  if (!rawFilter) {
-    const label = searchTerm ? `all readable messages containing "${searchTerm}"` : "all readable messages";
-    return {
-      type: "channel_export",
-      guildId,
-      channelId,
-      filter: { type: "all", label, searchTerm },
-    };
-  }
-
-  if (/^\d+$/.test(rawFilter)) {
-    const count = Number(rawFilter);
-    if (!Number.isFinite(count) || count <= 0) return null;
-    const label = searchTerm
-      ? `most recent ${count} messages containing "${searchTerm}"`
-      : `most recent ${count} messages`;
-    return {
-      type: "channel_export",
-      guildId,
-      channelId,
-      filter: { type: "count", count, label, searchTerm },
-    };
-  }
-
-  const rangeMatch = rawFilter.match(/^(\d{2}:\d{2}\s+\d{2}\/\d{2}\/(?:\d{2}|\d{4})|\d{2}\/\d{2}\/(?:\d{2}|\d{4}))\s*-\s*(\d{2}:\d{2}\s+\d{2}\/\d{2}\/(?:\d{2}|\d{4})|\d{2}\/\d{2}\/(?:\d{2}|\d{4}))$/);
-  if (!rangeMatch) return null;
-  const start = parseDmRangeToken(rangeMatch[1]);
-  const end = parseDmRangeToken(rangeMatch[2]);
-  if (!start || !end) return null;
-  const startMs = start.hasTime ? start.dt.toMillis() : start.dt.startOf("day").toMillis();
-  const endMs = end.hasTime ? end.dt.toMillis() : end.dt.endOf("day").toMillis();
-  if (endMs < startMs) return null;
-  const startLabel = start.hasTime ? start.dt.toFormat("HH:mm dd/MM/yy") : start.dt.toFormat("dd/MM/yy");
-  const endLabel = end.hasTime ? end.dt.toFormat("HH:mm dd/MM/yy") : end.dt.toFormat("dd/MM/yy");
-  const rangeLabel = `${startLabel}-${endLabel} GMT`;
-  return {
-    type: "channel_export",
-    guildId,
-    channelId,
-    filter: {
-      type: "date_range",
-      startMs,
-      endMs,
-      label: searchTerm ? `${rangeLabel} containing "${searchTerm}"` : rangeLabel,
-      searchTerm,
-    },
-  };
-}
-
-async function fetchChannelMessages(channel, filter, session = null) {
-  const allMessages = [];
-  let before;
-
-  while (true) {
-    if (session?.cancelled) break;
-    const batch = await channel.messages.fetch({ limit: 100, before });
-    if (!batch.size) break;
-    const items = Array.from(batch.values());
-    if (filter?.type === "count") {
-      allMessages.push(...items);
-      if (allMessages.length >= filter.count) break;
-    } else if (filter?.type === "date_range") {
-      for (const item of items) {
-        if (item.createdTimestamp >= filter.startMs && item.createdTimestamp <= filter.endMs) {
-          allMessages.push(item);
-        }
-      }
-      const oldestTimestamp = items[items.length - 1]?.createdTimestamp ?? 0;
-      if (oldestTimestamp < filter.startMs) break;
-    } else {
-      allMessages.push(...items);
-    }
-    before = items[items.length - 1]?.id;
-    if (batch.size < 100) break;
-  }
-
-  if (filter?.type === "count" && allMessages.length > filter.count) {
-    allMessages.length = filter.count;
-  }
-  const searchTerm = String(filter?.searchTerm || "").trim().toLowerCase();
-  const searchRegex = searchTerm ? new RegExp(`\\b${escapeRegex(searchTerm)}\\b`, "i") : null;
-  const filtered = searchTerm
-    ? allMessages.filter((message) => {
-        const haystacks = [
-          String(message.content || ""),
-          ...Array.from(message.embeds || []).flatMap((embed) => [
-            String(embed.title || ""),
-            String(embed.description || ""),
-          ]),
-          ...Array.from(message.attachments?.values?.() || []).map((attachment) => String(attachment.name || "")),
-        ];
-        return haystacks.some((value) => searchRegex.test(value));
-      })
-    : allMessages;
-  filtered.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-  return filtered;
-}
-
-function buildChannelTranscript(guild, channel, messages, filterLabel = "all readable messages") {
-  const lines = [
-    `Guild: ${guild.name} (${guild.id})`,
-    `Channel: ${channel.name || "(no name)"} (${channel.id})`,
-    `Selection: ${filterLabel}`,
-    `Exported At: ${DateTime.now().setZone("utc").toFormat("HH:mm dd/MM/yyyy 'GMT'")}`,
-    `Message Count: ${messages.length}`,
-    "",
-  ];
-
-  for (const message of messages) {
-    const createdAt = message.createdAt
-      ? DateTime.fromJSDate(message.createdAt, { zone: "utc" }).toFormat("HH:mm dd/MM/yyyy 'GMT'")
-      : "unknown_time";
-    const author = message.author?.tag || message.author?.username || "Unknown User";
-    lines.push(`[${createdAt}] **${author}**`);
-
-    const content = String(message.content || "").trim();
-    if (content) {
-      lines.push(content);
-    }
-
-    if (message.attachments?.size) {
-      for (const attachment of message.attachments.values()) {
-        lines.push(`[Attachment] ${attachment.name || "file"}: ${attachment.url}`);
-      }
-    }
-
-    if (message.embeds?.length) {
-      for (const embed of message.embeds) {
-        const embedParts = [];
-        if (embed.title) embedParts.push(`title=${embed.title}`);
-        if (embed.description) embedParts.push(`description=${embed.description}`);
-        if (embed.url) embedParts.push(`url=${embed.url}`);
-        if (embedParts.length) {
-          lines.push(`[Embed] ${embedParts.join(" | ")}`);
-        } else {
-          lines.push("[Embed]");
-        }
-      }
-    }
-
-    if (!content && !message.attachments?.size && !message.embeds?.length) {
-      lines.push("[No text content]");
-    }
-
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-const MAX_GUILD_SEARCH_MATCHES = 500;
-const MAX_GUILD_CHANNEL_SCAN_MESSAGES = 2000;
-
-async function fetchGuildSearchMatches(guild, searchTerm, count = null, session = null) {
-  const regex = new RegExp(`\\b${escapeRegex(searchTerm)}\\b`, "i");
-  const matches = [];
-  let truncated = false;
-
-  const channels = Array.from(guild.channels.cache.values())
-    .filter((channel) => channel?.isTextBased?.() && channel?.viewable && "messages" in channel)
-    .sort((a, b) => {
-      const positionA = Number(a?.rawPosition ?? 0);
-      const positionB = Number(b?.rawPosition ?? 0);
-      if (positionA !== positionB) return positionA - positionB;
-      return String(a?.name || "").localeCompare(String(b?.name || ""));
-    });
-
-  for (const channel of channels) {
-    if (session?.cancelled) break;
-    let before;
-    let scanned = 0;
-    while (true) {
-      if (session?.cancelled) break;
-      const batch = await channel.messages.fetch({ limit: 100, before });
-      if (!batch.size) break;
-      const items = Array.from(batch.values());
-      scanned += items.length;
-
-      for (const message of items) {
-        const haystacks = [
-          String(message.content || ""),
-          ...Array.from(message.embeds || []).flatMap((embed) => [
-            String(embed.title || ""),
-            String(embed.description || ""),
-          ]),
-          ...Array.from(message.attachments?.values?.() || []).map((attachment) => String(attachment.name || "")),
-        ];
-        if (haystacks.some((value) => regex.test(value))) {
-          matches.push({ message, channel });
-          if (matches.length >= MAX_GUILD_SEARCH_MATCHES) {
-            truncated = true;
-            break;
-          }
-        }
-      }
-
-      if (truncated) break;
-      before = items[items.length - 1]?.id;
-      if (batch.size < 100) break;
-      if (scanned >= MAX_GUILD_CHANNEL_SCAN_MESSAGES) {
-        truncated = true;
-        break;
-      }
-    }
-    if (truncated) break;
-  }
-
-  matches.sort((a, b) => b.message.createdTimestamp - a.message.createdTimestamp);
-  let selected = matches;
-  if (count && matches.length > count) {
-    selected = matches.slice(0, count);
-  }
-  selected.sort((a, b) => a.message.createdTimestamp - b.message.createdTimestamp);
-
-  return { matches: selected, truncated };
-}
-
-function buildGuildSearchTranscript(guild, matches, filterLabel, truncated = false) {
-  const lines = [
-    `Guild: ${guild.name} (${guild.id})`,
-    `Selection: ${filterLabel}${truncated ? " (capped)" : ""}`,
-    `Exported At: ${DateTime.now().setZone("utc").toFormat("HH:mm dd/MM/yyyy 'GMT'")}`,
-    `Message Count: ${matches.length}`,
-    "",
-  ];
-
-  for (const entry of matches) {
-    const { message, channel } = entry;
-    const createdAt = message.createdAt
-      ? DateTime.fromJSDate(message.createdAt, { zone: "utc" }).toFormat("HH:mm dd/MM/yyyy 'GMT'")
-      : "unknown_time";
-    const author = message.author?.tag || message.author?.username || "Unknown User";
-    const channelLabel = channel?.name ? `#${channel.name}` : channel?.id || "unknown_channel";
-    lines.push(`[${createdAt}] ${channelLabel} **${author}**`);
-
-    const content = String(message.content || "").trim();
-    if (content) {
-      lines.push(content);
-    }
-
-    if (message.attachments?.size) {
-      for (const attachment of message.attachments.values()) {
-        lines.push(`[Attachment] ${attachment.name || "file"}: ${attachment.url}`);
-      }
-    }
-
-    if (message.embeds?.length) {
-      for (const embed of message.embeds) {
-        const embedParts = [];
-        if (embed.title) embedParts.push(`title=${embed.title}`);
-        if (embed.description) embedParts.push(`description=${embed.description}`);
-        if (embed.url) embedParts.push(`url=${embed.url}`);
-        if (embedParts.length) {
-          lines.push(`[Embed] ${embedParts.join(" | ")}`);
-        } else {
-          lines.push("[Embed]");
-        }
-      }
-    }
-
-    if (!content && !message.attachments?.size && !message.embeds?.length) {
-      lines.push("[No text content]");
-    }
-
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-function chunkText(text, maxLen = 1800) {
-  const chunks = [];
-  let remaining = String(text || "");
-  while (remaining.length > maxLen) {
-    let splitAt = remaining.lastIndexOf("\n", maxLen);
-    if (splitAt <= 0) splitAt = maxLen;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
-  }
-  if (remaining) chunks.push(remaining);
-  return chunks;
-}
-
-function getActiveDmExport(userId) {
-  return activeDmExports.get(String(userId || "").trim()) || null;
-}
-
-function startDmExportSession(userId, key) {
-  const session = { key, cancelled: false };
-  activeDmExports.set(String(userId || "").trim(), session);
-  return session;
-}
-
-function cancelDmExportSession(userId) {
-  const session = getActiveDmExport(userId);
-  if (!session) return false;
-  session.cancelled = true;
-  return true;
-}
-
-function finishDmExportSession(userId, session) {
-  const current = getActiveDmExport(userId);
-  if (current === session) {
-    activeDmExports.delete(String(userId || "").trim());
-  }
 }
 
 function setTimersBackoff(isRateLimited = false) {
@@ -1910,38 +1272,6 @@ function scheduleSnapshotReconcile(activeSerials, rowStates) {
     rowStates: Array.isArray(rowStates) ? rowStates : [],
   };
   tryStartSnapshotReconcile();
-}
-
-function resetTimersSnapshot(reason) {
-  if (!timersSnapshot && !lastTimersText && !timersSnapshotRefreshPromise) return;
-  timersSnapshot = null;
-  timersSnapshotAt = 0;
-  lastTimersText = null;
-  lastTimersTextAt = 0;
-  timersSnapshotRefreshPromise = null;
-  timersSnapshotRefreshStartedAt = 0;
-  timersFailureStreak = 0;
-  timersNextFetchAttemptAt = 0;
-  timersLastFailureAt = 0;
-  timersSnapshotResetCounter += 1;
-  console.warn(`⚠️ Timers snapshot reset (${reason}).`);
-}
-
-function getTimersSnapshotStaleReason(now) {
-  if (timersSnapshot && timersSnapshotAt && now - timersSnapshotAt >= TIMERS_SNAPSHOT_HARD_RESET_MS) {
-    return "age";
-  }
-  if (
-    timersSnapshotRefreshPromise &&
-    timersSnapshotRefreshStartedAt &&
-    now - timersSnapshotRefreshStartedAt >= TIMERS_SNAPSHOT_REFRESH_HANG_MS
-  ) {
-    return "refresh_hang";
-  }
-  if (timersSnapshot && timersSnapshotAt && timersSnapshotAt > now + 5 * 60_000) {
-    return "clock_skew";
-  }
-  return null;
 }
 
 async function getTextBasedChannel(client, channelId) {
@@ -2048,46 +1378,18 @@ function startTimersInterval(client, channelId, messageId) {
 
 function parseReservationUTC(resStr) {
   if (!resStr || typeof resStr !== "string") return null;
-  const raw = resStr.trim();
-  const hmFirst = raw.match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (hmFirst) {
-    const hh = Number(hmFirst[1]);
-    const mm = Number(hmFirst[2]);
-    const dd = Number(hmFirst[3]);
-    const MM = Number(hmFirst[4]);
-    const yyyy = Number(hmFirst[5]);
-    const utcMs = Date.UTC(yyyy, MM - 1, dd, hh, mm, 0, 0);
-    if (Number.isFinite(utcMs)) return new Date(utcMs);
-  }
+  const m = resStr.trim().match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return null;
 
-  const dateFirst = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})$/);
-  if (dateFirst) {
-    let dd = Number(dateFirst[1]);
-    let MM = Number(dateFirst[2]);
-    const yyyy = Number(dateFirst[3]);
-    const hh = Number(dateFirst[4]);
-    const mm = Number(dateFirst[5]);
-    if (MM > 12 && dd <= 12) {
-      const swap = dd;
-      dd = MM;
-      MM = swap;
-    }
-    const utcMs = Date.UTC(yyyy, MM - 1, dd, hh, mm, 0, 0);
-    if (Number.isFinite(utcMs)) return new Date(utcMs);
-  }
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  const dd = Number(m[3]);
+  const MM = Number(m[4]);
+  const yyyy = Number(m[5]);
 
-  return null;
-}
-
-function normalizeReservationDisplay(value) {
-  const raw = String(value ?? "").trim();
-  if (!raw) return "—";
-  if (raw === "-" || raw === "–" || raw === "—") return "—";
-  return raw;
-}
-
-function isReservationMissing(value) {
-  return normalizeReservationDisplay(value) === "—";
+  const utcMs = Date.UTC(yyyy, MM - 1, dd, hh, mm, 0, 0);
+  if (!Number.isFinite(utcMs)) return null;
+  return new Date(utcMs);
 }
 
 async function findExistingReservationsMessage(channel, client) {
@@ -2098,7 +1400,7 @@ async function findExistingReservationsMessage(channel, client) {
       (m) =>
         m?.author?.id === client?.user?.id &&
         typeof m.content === "string" &&
-        (m.content.includes("Next reservation time") || m.content.includes("Next reservation time (UTC)"))
+        m.content.includes("Next reservation time (UTC)")
     ) || null
   );
 }
@@ -2121,7 +1423,6 @@ async function findPanelMessages(channel, client) {
 function startReservationsInterval(client, channelId, messageId) {
   let inFlight = false;
   let lastBottomCheckAt = 0;
-  let lastForcedRepostAt = Date.now();
   const BOTTOM_CHECK_MS = 3000;
   const tick = async () => {
     if (inFlight) return;
@@ -2133,19 +1434,12 @@ function startReservationsInterval(client, channelId, messageId) {
     try {
       updated = await fetchReservationsText({ cacheOnly: true });
       hadSnapshot = !!updated;
-      if (!updated) {
-        refreshTimersSnapshotInBackground().catch(() => {});
-        return;
-      }
+      if (!updated) return;
 
       const ch = await getTextBasedChannel(client, channelId);
       if (!ch?.isTextBased()) return;
       let shouldRepostAtBottom = false;
-      const now = Date.now();
-      if (now - lastForcedRepostAt >= RESERVATIONS_FORCE_REPOST_MS) {
-        shouldRepostAtBottom = true;
-        lastForcedRepostAt = now;
-      } else if (now >= startupStickyDelayUntil && now - lastBottomCheckAt >= BOTTOM_CHECK_MS) {
+      if (Date.now() >= startupStickyDelayUntil && Date.now() - lastBottomCheckAt >= BOTTOM_CHECK_MS) {
         lastBottomCheckAt = Date.now();
         try {
           const latest = await ch.messages.fetch({ limit: 1 });
@@ -2334,19 +1628,7 @@ async function fetchTimersSnapshotFromSheetDb() {
 
     const title = String(getRowValue(row, ["Title", "TITLE", "title"]) || "").trim();
     const done = parseBool(getRowValue(row, ["Done", "DONE", "done"]));
-    const reservationRaw = String(
-      getRowValue(row, [
-        "Reservation (UTC)",
-        "Reservations (UTC)",
-        "RESERVATION (UTC)",
-        "RESERVATIONS (UTC)",
-        "reservationUtc",
-        "reservation_utc",
-        "reservationsUtc",
-        "reservations_utc",
-      ]) || ""
-    ).trim();
-    const reservationStr = normalizeReservationDisplay(reservationRaw);
+    const reservationRaw = String(getRowValue(row, ["Reservation (UTC)", "RESERVATION (UTC)", "reservationUtc", "reservation_utc"]) || "").trim();
     const reminder = parseBool(getRowValue(row, ["Reminder", "REMINDER", "reminder"]));
     const pingUsed = parseBool(getRowValue(row, ["Pinged", "PINGED", "pinged", "Ping Used", "PING_USED", "pingUsed", "ping_used"]));
     const username = String(getRowValue(row, ["Username", "USERNAME", "username"]) || "").trim();
@@ -2374,7 +1656,7 @@ async function fetchTimersSnapshotFromSheetDb() {
       rowStates.push({
         serial,
         title,
-        reservationUtc: reservationStr,
+        reservationUtc: reservationRaw || "—",
         reminder,
         pingUsed,
         done,
@@ -2394,9 +1676,9 @@ async function fetchTimersSnapshotFromSheetDb() {
       }
     }
 
-    if (isReservationMissing(reservationStr)) continue;
+    if (!reservationRaw || reservationRaw === "—") continue;
 
-    const resUtc = parseReservationUTC(reservationStr);
+    const resUtc = parseReservationUTC(reservationRaw);
     if (!resUtc) continue;
     const resMs = resUtc.getTime();
     if (!done && resMs >= nowMs - 3600_000) {
@@ -2548,16 +1830,6 @@ function getOutstandingMadeAtMs(item) {
     "timestamp",
     "ts",
     "date",
-    "Made At (UTC)",
-    "Made At",
-    "Requested At (UTC)",
-    "Requested At",
-    "Submitted At (UTC)",
-    "Submitted At",
-    "Created At (UTC)",
-    "Created At",
-    "Timestamp (UTC)",
-    "Timestamp",
   ];
   for (const key of keys) {
     if (!(key in item)) continue;
@@ -2565,54 +1837,6 @@ function getOutstandingMadeAtMs(item) {
     if (Number.isFinite(ms)) return ms;
   }
   return null;
-}
-
-function isAsapOrMissingReservation(value) {
-  const normalized = normalizeReservationDisplay(value);
-  if (normalized === "—") return true;
-  return normalized.trim().toLowerCase() === "asap";
-}
-
-function shouldHideReservationFromCheck(item, nowMs) {
-  if (!item || typeof item !== "object") return false;
-  if (!Number.isFinite(nowMs)) return false;
-  const HIDE_AFTER_MS = 24 * 60 * 60 * 1000;
-
-  const doneRaw = item.done ?? item.Done ?? item["Done"];
-  if (parseBool(doneRaw)) return true;
-
-  const reservationRaw =
-    item.reservationUtc ??
-    item.reservationsUtc ??
-    item.reservation_utc ??
-    item.reservations_utc ??
-    item.reservation ??
-    item.Reservation ??
-    item["Reservation (UTC)"] ??
-    item["Reservations (UTC)"] ??
-    item["reservationUtc"] ??
-    item["reservationsUtc"] ??
-    item["Reservation"] ??
-    item["Reservations"];
-  if (isAsapOrMissingReservation(reservationRaw)) {
-    const madeAtMs = getOutstandingMadeAtMs(item);
-    if (!Number.isFinite(madeAtMs)) return false;
-    return nowMs - madeAtMs >= HIDE_AFTER_MS;
-  }
-
-  const reservationMs = parseAnyTimestampMs(reservationRaw);
-  if (!Number.isFinite(reservationMs)) return false;
-  return nowMs - reservationMs >= HIDE_AFTER_MS;
-}
-
-function mergeReservationForCheck(item, rowState) {
-  if (!item || typeof item !== "object") return item;
-  if (!rowState || typeof rowState !== "object") return item;
-  const merged = { ...item };
-  if (!merged.reservationUtc && rowState.reservationUtc) merged.reservationUtc = rowState.reservationUtc;
-  if (!merged.madeAtUtc && rowState.madeAtUtc) merged.madeAtUtc = rowState.madeAtUtc;
-  if (merged.done == null && rowState.done != null) merged.done = rowState.done;
-  return merged;
 }
 
 function getReservationUsername(item) {
@@ -2626,40 +1850,9 @@ function getReservationUsername(item) {
   return "Unknown";
 }
 
-function getManualReservationStartsByTitle(titles, nowMs = Date.now()) {
-  const titleSet = new Set(titles);
-  const byTitle = new Map();
-  const pushEntry = (entry) => {
-    const remindAtMs = Number(entry?.remindAtMs);
-    if (!Number.isFinite(remindAtMs) || remindAtMs <= nowMs) return;
-    const title = String(entry?.title || "").trim();
-    if (!titleSet.has(title)) return;
-    if (!byTitle.has(title)) byTitle.set(title, []);
-    byTitle.get(title).push(remindAtMs);
-  };
-
-  for (const entry of Object.values(manualReminderStore)) {
-    pushEntry(entry);
-  }
-
-  for (const entry of Object.values(remindersStore)) {
-    if (!entry || typeof entry !== "object") continue;
-    const kind = String(entry.kind || "").trim();
-    const reservationStr = normalizeReservationDisplay(entry.reservationStr);
-    const isNonReservation = kind === "custom" || isAsapOrMissingReservation(reservationStr);
-    if (!isNonReservation) continue;
-    pushEntry(entry);
-  }
-  for (const list of byTitle.values()) {
-    list.sort((a, b) => a - b);
-  }
-  return byTitle;
-}
-
 function renderTimersTextFromSnapshot() {
   if (!timersSnapshot) return null;
   const ageSeconds = Math.max(0, Math.floor((Date.now() - timersSnapshotAt) / 1000));
-  const nowMs = Date.now();
   const byTitle = new Map((timersSnapshot.timers || []).map((t) => [String(t.title), Number(t.elapsedSeconds) + ageSeconds]));
   const nextByTitle = new Map((timersSnapshot.nextReservations || []).map((t) => [
     String(t.title),
@@ -2674,52 +1867,15 @@ function renderTimersTextFromSnapshot() {
     { secondsUntil: Number(t.secondsUntil) - ageSeconds, reservationUtc: String(t.reservationUtc || "") },
   ]));
   const titles = ["Governor", "Architect", "Prefect", "General"];
-  const manualStartsByTitle = getManualReservationStartsByTitle(titles, nowMs);
-
-  for (const title of titles) {
-    const manualStarts = manualStartsByTitle.get(title);
-    if (!manualStarts || manualStarts.length === 0) continue;
-    const manualNextMs = manualStarts[0];
-    const current = nextByTitle.get(title);
-    const currentMs = current && Number.isFinite(current.secondsUntil)
-      ? nowMs + current.secondsUntil * 1000
-      : null;
-    if (!Number.isFinite(currentMs) || manualNextMs < currentMs) {
-      nextByTitle.set(title, {
-        secondsUntil: Math.max(0, Math.floor((manualNextMs - nowMs) / 1000)),
-        reservationUtc: formatUTCDateTime(new Date(manualNextMs)),
-      });
-    }
-  }
-  const formatTimestamp = (secondsUntil, style = "f") => {
-    if (!Number.isFinite(secondsUntil)) return null;
-    const unix = Math.floor((Date.now() + secondsUntil * 1000) / 1000);
-    return `<t:${unix}:${style}>`;
-  };
-  const formatDuration = (secondsUntil) => {
-    if (!Number.isFinite(secondsUntil)) return null;
-    if (secondsUntil <= 59) return "Available";
-    const mmTotal = Math.floor(secondsUntil / 60);
-    const hh = Math.floor(mmTotal / 60);
-    const mm = mmTotal % 60;
-    return hh > 0 ? `${hh}h ${mm}m` : `${mm}m`;
-  };
   const formatRemaining = (title) => {
     const possible = nextPossibleByTitle.get(title);
-    const possibleSeconds = possible?.secondsUntil;
-    const possibleFormatted = formatDuration(possibleSeconds);
-
-    const nextReservation = nextByTitle.get(title);
-    const nextReservationFormatted = formatDuration(nextReservation?.secondsUntil);
-    if (
-      nextReservationFormatted &&
-      nextReservationFormatted !== "Available" &&
-      (!Number.isFinite(possibleSeconds) || possibleSeconds <= 59)
-    ) {
-      return nextReservationFormatted;
+    if (possible && Number.isFinite(possible.secondsUntil)) {
+      if (possible.secondsUntil <= 59) return "Available";
+      const mmTotal = Math.floor(possible.secondsUntil / 60);
+      const hh = Math.floor(mmTotal / 60);
+      const mm = mmTotal % 60;
+      return hh > 0 ? `${hh}h ${mm}m` : `${mm}m`;
     }
-
-    if (possibleFormatted) return possibleFormatted;
 
     // Fallback for old Apps Script snapshot shape (elapsed-only).
     const elapsedSeconds = byTitle.get(title);
@@ -2729,51 +1885,24 @@ function renderTimersTextFromSnapshot() {
     const mm = Math.floor(remaining / 60);
     return `${mm}m`;
   };
-  for (const title of titles) {
-    const manualStarts = manualStartsByTitle.get(title) || [];
-    const hasManual = manualStarts.length > 0;
-    const cooldownSeconds = Number(activeCooldownByTitle.get(title));
-    const hasActiveCooldown = Number.isFinite(cooldownSeconds) && cooldownSeconds > 0;
-    const existing = nextPossibleByTitle.get(title);
-    const existingMs = existing && Number.isFinite(existing.secondsUntil)
-      ? nowMs + existing.secondsUntil * 1000
-      : null;
-    if (!existingMs && !hasManual && !hasActiveCooldown) continue;
-
-    let candidateMs = Number.isFinite(existingMs)
-      ? Math.max(existingMs, Math.ceil(nowMs / 60000) * 60000)
-      : Math.ceil(nowMs / 60000) * 60000;
-
-    if (hasActiveCooldown) {
-      const cooldownMs = nowMs + cooldownSeconds * 1000;
-      if (cooldownMs > candidateMs) candidateMs = cooldownMs;
-    }
-
-    for (const startMs of manualStarts) {
-      if (candidateMs + 3600_000 <= startMs) break;
-      const reservationEnd = startMs + 3600_000;
-      if (candidateMs < reservationEnd) candidateMs = reservationEnd;
-    }
-
-    nextPossibleByTitle.set(title, {
-      secondsUntil: Math.max(0, Math.floor((candidateMs - nowMs) / 1000)),
-      reservationUtc: formatUTCDateTime(new Date(candidateMs)),
-    });
-  }
-
   const formatNextPossible = (title, next) => {
     const hasUpcomingReservation = nextByTitle.has(title);
     const cooldownSeconds = Number(activeCooldownByTitle.get(title));
     const hasActiveCooldown = Number.isFinite(cooldownSeconds) && cooldownSeconds > 0;
     if (!hasUpcomingReservation && !hasActiveCooldown) return "Any time/date";
     if (!next || !Number.isFinite(next.secondsUntil) || !next.reservationUtc) return "Unknown";
-    const stamp = formatTimestamp(next.secondsUntil, "t");
-    return stamp || "Unknown";
+    const res = next.reservationUtc;
+    const match = res.match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (!match) return res;
+    const timePart = `${match[1]}:${match[2]}`;
+    const datePart = `${match[3]}/${match[4]}/${match[5]}`;
+    const todayUtc = new Date().toISOString().slice(0, 10).split("-").reverse().join("/");
+    return datePart === todayUtc ? timePart : `${timePart} ${datePart}`;
   };
 
   const lines = [
     "\u200b",
-    "Next reservation time possible",
+    "Next reservation time possible (UTC)",
     ...titles.map((t) => `-# ${t}: ${formatNextPossible(t, nextPossibleByTitle.get(t))}`),
     "",
     "Time left until title is available",
@@ -2789,10 +1918,6 @@ function renderTimersTextFromSnapshot() {
 async function fetchTimersText(opts = {}) {
   const cacheOnly = !!opts.cacheOnly;
   const now = Date.now();
-  const staleReason = getTimersSnapshotStaleReason(now);
-  if (staleReason) {
-    resetTimersSnapshot(staleReason);
-  }
   if (cacheOnly) {
     const rendered = renderTimersTextFromSnapshot();
     if (rendered) return rendered;
@@ -2806,11 +1931,9 @@ async function fetchTimersText(opts = {}) {
   if (!timersSnapshot || now - timersSnapshotAt >= TIMERS_REFRESH_MS) {
     if (!timersSnapshotRefreshPromise) {
       timersSnapshotRefreshPromise = (async () => {
-        const refreshGeneration = timersSnapshotResetCounter;
         let json;
         let source = SHEETDB_URL ? "sheetdb" : "apps_script";
         const fetchStartedAt = Date.now();
-        timersSnapshotRefreshStartedAt = fetchStartedAt;
         try {
           if (SHEETDB_URL) {
             json = await fetchTimersSnapshotFromSheetDb();
@@ -2849,9 +1972,6 @@ async function fetchTimersText(opts = {}) {
         }
 
         const postProcessStartedAt = Date.now();
-        if (refreshGeneration !== timersSnapshotResetCounter) {
-          return false;
-        }
         timersFailureStreak = 0;
         timersNextFetchAttemptAt = 0;
         timersSnapshot = json;
@@ -2864,7 +1984,6 @@ async function fetchTimersText(opts = {}) {
         return true;
       })().finally(() => {
         timersSnapshotRefreshPromise = null;
-        timersSnapshotRefreshStartedAt = 0;
       });
     }
 
@@ -2880,34 +1999,11 @@ async function fetchTimersText(opts = {}) {
 function renderReservationsTextFromSnapshot() {
   if (!timersSnapshot) return null;
   const ageSeconds = Math.max(0, Math.floor((Date.now() - timersSnapshotAt) / 1000));
-  const nowMs = Date.now();
   const nextByTitle = new Map((timersSnapshot.nextReservations || []).map((t) => [
     String(t.title),
     { secondsUntil: Number(t.secondsUntil) - ageSeconds, reservationUtc: String(t.reservationUtc || "") },
   ]));
   const titles = ["Governor", "Architect", "Prefect", "General"];
-  const manualStartsByTitle = getManualReservationStartsByTitle(titles, nowMs);
-
-  for (const title of titles) {
-    const manualStarts = manualStartsByTitle.get(title);
-    if (!manualStarts || manualStarts.length === 0) continue;
-    const manualNextMs = manualStarts[0];
-    const current = nextByTitle.get(title);
-    const currentMs = current && Number.isFinite(current.secondsUntil)
-      ? nowMs + current.secondsUntil * 1000
-      : null;
-    if (!Number.isFinite(currentMs) || manualNextMs < currentMs) {
-      nextByTitle.set(title, {
-        secondsUntil: Math.max(0, Math.floor((manualNextMs - nowMs) / 1000)),
-        reservationUtc: formatUTCDateTime(new Date(manualNextMs)),
-      });
-    }
-  }
-  const formatTimestamp = (secondsUntil, style = "f") => {
-    if (!Number.isFinite(secondsUntil)) return null;
-    const unix = Math.floor((Date.now() + secondsUntil * 1000) / 1000);
-    return `<t:${unix}:${style}>`;
-  };
   const formatUntil = (next) => {
     if (!next || !Number.isFinite(next.secondsUntil)) return "No reservation";
     if (next.secondsUntil <= 0) return "No reservation";
@@ -2915,15 +2011,21 @@ function renderReservationsTextFromSnapshot() {
     const hh = Math.floor(mmTotal / 60);
     const mm = mmTotal % 60;
     const remainingStr = hh > 0 ? `${hh}h ${mm}m` : `${mm}m`;
-    const stamp = formatTimestamp(next.secondsUntil, "t");
-    if (!stamp) return `Next reservation in ${mm}m`;
-    const relative = formatTimestamp(next.secondsUntil, "R");
-    return `Next reservation at ${stamp}, in ${relative || remainingStr}`;
+    const res = next.reservationUtc;
+    const match = res.match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (!match) return `Next reservation in ${mm}m`;
+    const timePart = `${match[1]}:${match[2]}`;
+    const datePart = `${match[3]}/${match[4]}/${match[5]}`;
+    const todayUtc = new Date().toISOString().slice(0, 10).split("-").reverse().join("/");
+    if (datePart === todayUtc) {
+      return `Next reservation at ${timePart}, in ${remainingStr}`;
+    }
+    return `Next reservation at ${timePart} ${datePart}, in ${remainingStr}`;
   };
 
   return [
     "\u200b",
-    "Next reservation time",
+    "Next reservation time (UTC)",
     ...titles.map((t) => `-# ${t}: ${formatUntil(nextByTitle.get(t))}`),
   ].join("\n");
 }
@@ -2931,10 +2033,7 @@ function renderReservationsTextFromSnapshot() {
 async function fetchReservationsText(opts = {}) {
   const cacheOnly = !!opts.cacheOnly;
   const now = Date.now();
-  if (cacheOnly) {
-    if (!timersSnapshot || now - timersSnapshotAt > RESERVATIONS_CACHE_MAX_AGE_MS) return null;
-    return renderReservationsTextFromSnapshot();
-  }
+  if (cacheOnly) return renderReservationsTextFromSnapshot();
   if (now < timersNextFetchAttemptAt) return null;
   if (!timersSnapshot || now - timersSnapshotAt >= TIMERS_REFRESH_MS) {
     await fetchTimersText();
@@ -3068,9 +2167,7 @@ async function updateAllReservationsMessages(client) {
   );
 }
 
-function cancelReminder(rowSerial, opts = {}) {
-  const keepMetaIfFired = !!opts.keepMetaIfFired;
-  const keepStore = !!opts.keepStore;
+function cancelReminder(rowSerial, keepMetaIfFired = false) {
   const key = String(rowSerial);
   const t = reminderTimers.get(key);
   if (t) clearTimeout(t);
@@ -3078,68 +2175,6 @@ function cancelReminder(rowSerial, opts = {}) {
   const meta = reminderMeta.get(key);
   if (keepMetaIfFired && meta?.fired) return;
   reminderMeta.delete(key);
-  if (!keepStore) clearReminderStoreEntry(key);
-}
-
-function getReminderStoreEntry(key) {
-  const entry = remindersStore[String(key)];
-  if (!entry || typeof entry !== "object") return null;
-  return entry;
-}
-
-function setReminderStoreEntry(key, entry) {
-  if (!entry || typeof entry !== "object") return;
-  remindersStore[String(key)] = entry;
-  persistRemindersStore();
-}
-
-function clearReminderStoreEntry(key) {
-  const id = String(key);
-  if (Object.prototype.hasOwnProperty.call(remindersStore, id)) {
-    delete remindersStore[id];
-    persistRemindersStore();
-  }
-}
-
-function isActiveCustomReminder(rowSerial, now = Date.now()) {
-  const entry = getReminderStoreEntry(rowSerial);
-  if (!entry || typeof entry !== "object") return false;
-  if (entry.kind !== "custom") return false;
-  const firedAtMs = Number(entry.firedAtMs);
-  if (Number.isFinite(firedAtMs)) return false;
-  const remindAtMs = Number(entry.remindAtMs);
-  if (!Number.isFinite(remindAtMs)) return false;
-  return remindAtMs > now;
-}
-
-function markReminderFiredInStore(key) {
-  const entry = getReminderStoreEntry(key);
-  if (!entry) return;
-  entry.firedAtMs = Date.now();
-  setReminderStoreEntry(key, entry);
-}
-
-function pruneRemindersStore(now = Date.now()) {
-  let changed = false;
-  for (const [key, entry] of Object.entries(remindersStore)) {
-    if (!entry || typeof entry !== "object") {
-      delete remindersStore[key];
-      changed = true;
-      continue;
-    }
-    const firedAtMs = Number(entry.firedAtMs);
-    if (Number.isFinite(firedAtMs) && now - firedAtMs > REMINDER_FIRED_RETENTION_MS) {
-      delete remindersStore[key];
-      changed = true;
-      continue;
-    }
-    const remindAtMs = Number(entry.remindAtMs);
-    if (Number.isFinite(remindAtMs) && now - remindAtMs > REMINDER_LATE_GRACE_MS) {
-      delete remindersStore[key];
-      changed = true;
-    }
-  }
-  if (changed) persistRemindersStore();
 }
 
 async function deleteMessageRef(client, channelId, messageId) {
@@ -3213,17 +2248,12 @@ async function reconcileDeletedReservations(activeSerials) {
   }
 }
 
-function upsertEmbedField(fields, name, value, inline = true, preferredName = null) {
+function upsertEmbedField(fields, name, value, inline = true) {
   const idx = fields.findIndex((f) => String(f.name || "").toLowerCase().includes(String(name).toLowerCase()));
   if (idx >= 0) {
-    fields[idx] = {
-      ...fields[idx],
-      name: preferredName || fields[idx].name,
-      value: String(value),
-      inline: fields[idx].inline ?? inline,
-    };
+    fields[idx] = { ...fields[idx], value: String(value), inline: fields[idx].inline ?? inline };
   } else {
-    fields.push({ name: preferredName || name, value: String(value), inline });
+    fields.push({ name, value: String(value), inline });
   }
 }
 
@@ -3272,8 +2302,6 @@ function isPingHidden(serial) {
   return pingHiddenByRow.get(String(serial)) === true;
 }
 
-const SERIAL_COLLISION_GRACE_MS = 10 * 60 * 1000;
-
 async function reconcileReservationState(rowStates) {
   if (reservationStateSyncInFlight) return;
   if (!Array.isArray(rowStates) || !runtimeClient) return;
@@ -3286,42 +2314,18 @@ async function reconcileReservationState(rowStates) {
       const ref = reservationMessages.get(serial);
       if (!ref?.requestChannelId || !ref?.requestMessageId) continue;
 
-      const rowCreatedAtMs = parseAnyTimestampMs(rowState?.madeAtUtc);
-      const refCreatedAtMs = Number(ref.requestCreatedAt || 0);
-      if (
-        Number.isFinite(rowCreatedAtMs) &&
-        Number.isFinite(refCreatedAtMs) &&
-        Math.abs(rowCreatedAtMs - refCreatedAtMs) > SERIAL_COLLISION_GRACE_MS
-      ) {
-        // Serial looks reused. Clear local mappings so we don't edit the wrong message.
-        cancelReminder(serial);
-        if (reservationOwners.delete(serial)) persistReservationOwners();
-        if (reservationMessages.delete(serial)) persistReservationMessages();
-        orphanDeletionCandidates.delete(serial);
-        auditLog("serial_collision_reset", { rowSerial: serial, refCreatedAtMs, rowCreatedAtMs });
-        continue;
-      }
-
       let requestMsg = null;
       try {
         const requestChannel = await runtimeClient.channels.fetch(ref.requestChannelId);
         if (requestChannel?.isTextBased()) {
           requestMsg = await requestChannel.messages.fetch(ref.requestMessageId);
         }
-      } catch (e) {
-        console.error("reservation reconcile fetch failed:", {
-          serial,
-          channelId: ref.requestChannelId,
-          messageId: ref.requestMessageId,
-          error: e?.message || e,
-        });
-      }
+      } catch {}
       if (!requestMsg) continue;
 
-      const reservationStr = normalizeReservationDisplay(rowState.reservationUtc);
+      const reservationStr = String(rowState.reservationUtc || "—").trim() || "—";
       const completed = getEffectiveDoneState(serial, rowState.done);
-      const customReminderActive = !completed && isActiveCustomReminder(serial);
-      const reminderEnabled = (!!rowState.reminder && !isReservationMissing(reservationStr) && !completed) || customReminderActive;
+      const reminderEnabled = !!rowState.reminder && reservationStr !== "—" && !completed;
       const currentIds = parseCurrentCustomIds(requestMsg);
       const hasPingButtonNow = currentIds.some((id) => id.startsWith("ping_"));
       const renderedCompleted = getCompletedFromEmbed(requestMsg);
@@ -3351,7 +2355,7 @@ async function reconcileReservationState(rowStates) {
       const rowUsername = String(rowState.username || "").trim();
       const embed = existingEmbed
         ? EmbedBuilder.from(existingEmbed)
-        : new EmbedBuilder().setTitle("📋 New Title Request");
+        : new EmbedBuilder().setTitle(rowUsername === "#TEST" ? "📋 TEST" : "📋 New Title Request");
       const fields = (existingEmbed?.fields || []).map((f) => ({ name: f.name, value: f.value, inline: f.inline }));
       if (String(rowState.username || "").trim()) {
         upsertEmbedField(fields, "Username", String(rowState.username).trim(), true);
@@ -3362,7 +2366,7 @@ async function reconcileReservationState(rowStates) {
       if (String(rowState.title || "").trim()) {
         upsertEmbedField(fields, "Title", String(rowState.title).trim(), true);
       }
-      upsertEmbedField(fields, "Reservation", reservationStr, true, "🕒 Reservation (UTC)");
+      upsertEmbedField(fields, "Reservation", reservationStr, true);
       embed.setFields(fields);
       if (completed) {
         embed.setColor(0x777777).setFooter({ text: "Completed" });
@@ -3382,48 +2386,21 @@ async function reconcileReservationState(rowStates) {
 
       try {
         await requestMsg.edit({ embeds: [embed], components: [actionRow] });
-      } catch (e) {
-        console.error("reservation reconcile edit failed:", {
-          serial,
-          channelId: ref.requestChannelId,
-          messageId: ref.requestMessageId,
-          error: e?.message || e,
-        });
-      }
+      } catch {}
 
       if (!reminderEnabled) {
         cancelReminder(serial);
         continue;
       }
 
-      if (customReminderActive) {
-        continue;
-      }
-
       const reservationUtc = parseReservationUTC(reservationStr);
-      if (!reservationUtc) {
-        cancelReminder(serial);
-        continue;
-      }
-
-      const nowMs = Date.now();
-      const resMs = reservationUtc.getTime();
-      const storeEntry = getReminderStoreEntry(serial);
-      const alreadyFired = storeEntry?.firedAtMs && storeEntry?.reservationStr === reservationStr;
-      const isLate = resMs <= nowMs;
-      const withinGrace = isLate && nowMs - resMs <= REMINDER_LATE_GRACE_MS;
-
-      if (isLate && alreadyFired) {
-        cancelReminder(serial, { keepMetaIfFired: true, keepStore: true });
-        continue;
-      }
-      if (isLate && !withinGrace) {
+      if (!reservationUtc || reservationUtc.getTime() <= Date.now()) {
         cancelReminder(serial);
         continue;
       }
 
       const existingMeta = reminderMeta.get(serial) || {};
-      if (!withinGrace && reminderTimers.has(serial) && existingMeta.reservationStr === reservationStr) {
+      if (reminderTimers.has(serial) && existingMeta.reservationStr === reservationStr) {
         continue;
       }
 
@@ -3517,31 +2494,6 @@ function extractDiscordMessageLinkFromUrl(url) {
   if (!match) return null;
   return { channelId: match[2], messageId: match[3] };
 }
-async function updateOriginalRequestFromSourceUrl(client, sourceUrl, rowSerial, completedOverride, showPingOverride) {
-  const link = extractDiscordMessageLinkFromUrl(sourceUrl);
-  if (!link) return false;
-
-  const ch = await client.channels.fetch(link.channelId);
-  if (!ch?.isTextBased()) return false;
-
-  const msg = await ch.messages.fetch(link.messageId);
-  const reservationStr = getReservationFromEmbed(msg);
-  const completed = typeof completedOverride === "boolean" ? completedOverride : getCompletedFromEmbed(msg);
-  const pingUserId = resolvePingUserId(msg, rowSerial);
-  const base = msg.embeds?.[0]
-    ? EmbedBuilder.from(msg.embeds[0])
-    : new EmbedBuilder().setTitle("📋 Title Request");
-  if (completed) {
-    base.setColor(0x777777).setFooter({ text: "Completed" });
-  } else {
-    base.setColor(0x00ff00).setFooter(null);
-  }
-
-  const showPing = typeof showPingOverride === "boolean" ? showPingOverride : !isPingHidden(rowSerial);
-  const updatedRow = buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, showPing);
-  await msg.edit({ embeds: [base], components: [updatedRow] });
-  return true;
-}
 async function updateOriginalRequestFromReminder(client, reminderMessage, rowSerial, completedOverride, showPingOverride) {
   const link = extractDiscordMessageLink(reminderMessage?.content);
   if (!link) return false;
@@ -3624,13 +2576,6 @@ async function postReminder({ client, channelId, rowSerial, title, username, coo
     reminderMessageId: sent.id,
     reminderChannelId: sent.channelId,
   });
-  markReminderFiredInStore(key);
-  pruneRemindersStore();
-  auditLog("remind_fire", {
-    rowSerial,
-    reminderChannelId: sent.channelId,
-    reminderMessageId: sent.id,
-  });
 
   if (sourceMessageUrl) {
     const ref = extractDiscordMessageLinkFromUrl(sourceMessageUrl);
@@ -3652,27 +2597,15 @@ async function postReminder({ client, channelId, rowSerial, title, username, coo
   }
 }
 
-function scheduleReminder({ client, rowSerial, reservationUtc, channelId, sourceMessageUrl, title, username, coordinates, discordMention, reservationStr, kind = "reservation" }) {
+function scheduleReminder({ client, rowSerial, reservationUtc, channelId, sourceMessageUrl, title, username, coordinates, discordMention, reservationStr }) {
   const key = String(rowSerial);
   const remindAtMs = reservationUtc.getTime();
 
   // overwrite existing
-  cancelReminder(key, { keepStore: true });
+  cancelReminder(key);
 
   // keep meta so the reminder can print correctly
-  reminderMeta.set(key, { title, username, coordinates, discordMention, channelId, sourceUrl: sourceMessageUrl, reservationStr, remindAtMs, kind });
-  setReminderStoreEntry(key, {
-    remindAtMs,
-    reservationStr,
-    channelId,
-    sourceUrl: sourceMessageUrl,
-    title,
-    username,
-    coordinates,
-    discordMention,
-    armedAtMs: Date.now(),
-    kind,
-  });
+  reminderMeta.set(key, { title, username, coordinates, discordMention, channelId, sourceUrl: sourceMessageUrl, reservationStr });
 
   const arm = () => {
     const now = Date.now();
@@ -3702,49 +2635,6 @@ function scheduleReminder({ client, rowSerial, reservationUtc, channelId, source
   arm();
 }
 
-function rehydrateReminders(client) {
-  if (!client) return;
-  pruneRemindersStore();
-  const now = Date.now();
-  for (const [key, entry] of Object.entries(remindersStore)) {
-    if (!entry || typeof entry !== "object") continue;
-    const firedAtMs = Number(entry.firedAtMs);
-    if (Number.isFinite(firedAtMs) && now - firedAtMs <= REMINDER_FIRED_RETENTION_MS) continue;
-
-    let remindAtMs = Number(entry.remindAtMs);
-    const reservationStr = String(entry.reservationStr || "").trim();
-    if (!Number.isFinite(remindAtMs) && reservationStr) {
-      const parsed = parseReservationUTC(reservationStr);
-      if (parsed) remindAtMs = parsed.getTime();
-    }
-    if (!Number.isFinite(remindAtMs)) {
-      clearReminderStoreEntry(key);
-      continue;
-    }
-    if (now - remindAtMs > REMINDER_LATE_GRACE_MS) {
-      clearReminderStoreEntry(key);
-      continue;
-    }
-
-    const reservationUtc = new Date(remindAtMs);
-    const kind = entry.kind || "reservation";
-    const displayReservationStr = reservationStr || (kind === "custom" ? "" : formatUTCDateTime(reservationUtc));
-    scheduleReminder({
-      client,
-      rowSerial: key,
-      reservationUtc,
-      channelId: entry.channelId || FORM_CHANNEL_ID,
-      sourceMessageUrl: entry.sourceUrl || null,
-      title: entry.title || "Title",
-      username: entry.username || "Username",
-      coordinates: entry.coordinates || "—",
-      discordMention: entry.discordMention || null,
-      reservationStr: displayReservationStr,
-      kind,
-    });
-  }
-}
-
 // =====================
 // UI BUILDERS
 // =====================
@@ -3755,65 +2645,6 @@ function buildPanelPayload() {
     .setColor(0x2b2d31);
 
   return { embeds: [embed], components: buildPanelComponents() };
-}
-
-function buildRemindSetupMessage(draft = {}) {
-  const title = draft.titleLabel || draft.titleValue || "—";
-  const username = draft.username || "—";
-  const timeInput = draft.timeInput || "—";
-  return [
-    "Reminder setup:",
-    `Title: ${title}`,
-    `Username: ${username}`,
-    `Time: ${timeInput}`,
-  ].join("\n");
-}
-
-function collectOutstandingReminders(nowMs = Date.now()) {
-  const items = [];
-
-  for (const [key, entry] of Object.entries(manualReminderStore)) {
-    const remindAtMs = Number(entry?.remindAtMs);
-    if (!Number.isFinite(remindAtMs) || remindAtMs <= nowMs) continue;
-    items.push({
-      kind: "manual",
-      id: key,
-      remindAtMs,
-      title: entry?.title || "Title",
-      username: entry?.username || "Username",
-    });
-  }
-
-  for (const [key, entry] of Object.entries(remindersStore)) {
-    if (entry?.firedAtMs) continue;
-    let remindAtMs = Number(entry?.remindAtMs);
-    if (!Number.isFinite(remindAtMs) && entry?.reservationStr) {
-      const parsed = parseReservationUTC(String(entry.reservationStr));
-      if (parsed) remindAtMs = parsed.getTime();
-    }
-    if (!Number.isFinite(remindAtMs) || remindAtMs <= nowMs) continue;
-    items.push({
-      kind: "reservation",
-      id: key,
-      remindAtMs,
-      title: entry?.title || "Title",
-      username: entry?.username || "Username",
-    });
-  }
-
-  items.sort((a, b) => a.remindAtMs - b.remindAtMs);
-  return items;
-}
-
-function scheduleEphemeralDelete(message, token, isOriginal = false) {
-  if (!message || !token) return;
-  setTimeout(async () => {
-    try {
-      const target = isOriginal ? "@original" : message.id;
-      if (!target) return;
-      await rest.delete(Routes.webhookMessage(CLIENT_ID, token, target)).catch(() => {});
-    } catch {}
-  }, EPHEMERAL_TTL_MS);
 }
 
 function buildPanelComponents() {
@@ -3833,118 +2664,6 @@ function buildTitleSelectRow() {
     );
 
   return new ActionRowBuilder().addComponents(select);
-}
-
-function buildRemindTitleSelectRow() {
-  const select = new StringSelectMenuBuilder()
-    .setCustomId("remind_title_select")
-    .setPlaceholder("Choose a reminder title…")
-    .addOptions(
-      TITLES.map((t) => ({
-        label: t.label,
-        description: t.description,
-        value: t.value,
-      }))
-    );
-
-  return new ActionRowBuilder().addComponents(select);
-}
-
-function buildRemindSetupComponents() {
-  return [
-    buildRemindTitleSelectRow(),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("remind_edit_details")
-        .setLabel("Edit Details")
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId("remind_done")
-        .setLabel("Done")
-        .setStyle(ButtonStyle.Primary)
-    ),
-  ];
-}
-
-function buildRemindDetailsModal(draft = {}, tzLabel = "UTC") {
-  const modal = new ModalBuilder().setCustomId("remind_details_modal").setTitle("Set Reminder Details");
-
-  const username = new TextInputBuilder()
-    .setCustomId("remind_username")
-    .setLabel("Game Username")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-  if (draft.username) username.setValue(String(draft.username).slice(0, 100));
-
-  const timeInput = new TextInputBuilder()
-    .setCustomId("remind_time")
-    .setLabel(`Reminder Time (${tzLabel})`)
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setPlaceholder("23:42 or in 1 hour 30 minutes");
-  if (draft.timeInput) timeInput.setValue(String(draft.timeInput).slice(0, 100));
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(username),
-    new ActionRowBuilder().addComponents(timeInput)
-  );
-
-  return modal;
-}
-
-function buildRemindInDetailsModal(rowSerial, draft = {}, tzLabel = "UTC") {
-  const modal = new ModalBuilder()
-    .setCustomId(`remind_in_details_modal:${rowSerial}`)
-    .setTitle("Set Reminder Details");
-
-  const username = new TextInputBuilder()
-    .setCustomId("remind_in_username")
-    .setLabel("Game Username")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-  if (draft.username) username.setValue(String(draft.username).slice(0, 100));
-
-  const timeInput = new TextInputBuilder()
-    .setCustomId("remind_in_time")
-    .setLabel(`Reminder Time (${tzLabel})`)
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setPlaceholder("23:42 or in 1 hour 30 minutes");
-  if (draft.timeInput) timeInput.setValue(String(draft.timeInput).slice(0, 100));
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(username),
-    new ActionRowBuilder().addComponents(timeInput)
-  );
-
-  return modal;
-}
-
-function buildManualReminderCancelRow(reminderId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`manual_remind_cancel:${reminderId}`)
-      .setLabel("Cancel Reminder")
-      .setStyle(ButtonStyle.Danger)
-  );
-}
-
-function buildCustomReminderCancelRow(rowSerial) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`custom_remind_cancel:${rowSerial}`)
-      .setLabel("Cancel Reminder")
-      .setStyle(ButtonStyle.Danger)
-  );
-}
-
-function buildAnnounceReminderCancelRow(rowSerial) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`announce_remind_cancel:${rowSerial}`)
-      .setLabel("Cancel Reminder")
-      .setStyle(ButtonStyle.Danger)
-  );
 }
 
 function buildPanelActionsRow() {
@@ -4255,12 +2974,12 @@ function buildRequestActionRow(
     buildDoneButton(rowSerial, !!completed, pingUserId)
   );
 
-  const normalizedReservation = normalizeReservationDisplay(reservationStr);
-  const reservationMissing = isAsapOrMissingReservation(normalizedReservation);
-  const hasReservation = !reservationMissing;
-  const reservationUtc = hasReservation ? parseReservationUTC(normalizedReservation) : null;
+  const hasReservation =
+    typeof reservationStr === "string" &&
+    reservationStr.trim() !== "" &&
+    reservationStr.trim() !== "—";
+  const reservationUtc = hasReservation ? parseReservationUTC(reservationStr) : null;
   const reservationInFuture = reservationUtc ? reservationUtc.getTime() > Date.now() : false;
-  const hasCustomReminder = !completed && isActiveCustomReminder(rowSerial);
 
   if (hasReservation && reservationInFuture && !completed) {
     if (remindMode === "cancel") {
@@ -4275,22 +2994,6 @@ function buildRequestActionRow(
         new ButtonBuilder()
           .setCustomId(`remind_${rowSerial}`)
           .setLabel("⏰ Remind")
-          .setStyle(ButtonStyle.Primary)
-      );
-    }
-  } else if (!hasReservation && !completed) {
-    if (hasCustomReminder) {
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(`remind_cancel_${rowSerial}`)
-          .setLabel("🛑 Cancel Remind")
-          .setStyle(ButtonStyle.Danger)
-      );
-    } else {
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(`remind_in_${rowSerial}`)
-          .setLabel("🕒 Remind In")
           .setStyle(ButtonStyle.Primary)
       );
     }
@@ -4447,6 +3150,331 @@ function isOnCooldown(userId, actionKey, ms) {
 // =====================
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getEmergencyLockdownBackupPath(guildId) {
+  return path.join(__dirname, `emergency-lockdown-backup-${guildId}.json`);
+}
+
+async function writeEmergencyLockdownBackup(guild) {
+  await guild.channels.fetch();
+  await guild.roles.fetch();
+
+  const snapshot = {
+    ts: new Date().toISOString(),
+    guildId: guild.id,
+    guildName: guild.name,
+    roles: Array.from(guild.roles.cache.values())
+      .sort((a, b) => b.position - a.position)
+      .map((role) => ({
+        id: role.id,
+        name: role.name,
+        color: role.color,
+        position: role.position,
+        managed: role.managed,
+        mentionable: role.mentionable,
+        hoist: role.hoist,
+        permissions: role.permissions.bitfield.toString(),
+      })),
+    channels: Array.from(guild.channels.cache.values())
+      .sort((a, b) => (a.rawPosition ?? 0) - (b.rawPosition ?? 0))
+      .map((channel) => ({
+        id: channel.id,
+        name: channel.name,
+        type: channel.type,
+        parentId: channel.parentId ?? null,
+        position: channel.rawPosition ?? 0,
+        permissionOverwrites: Array.from(channel.permissionOverwrites.cache.values()).map((overwrite) => ({
+          id: overwrite.id,
+          type: overwrite.type,
+          allow: overwrite.allow.bitfield.toString(),
+          deny: overwrite.deny.bitfield.toString(),
+        })),
+      })),
+  };
+
+  const backupPath = getEmergencyLockdownBackupPath(guild.id);
+  await fs.promises.writeFile(backupPath, JSON.stringify(snapshot, null, 2), "utf8");
+  return backupPath;
+}
+
+async function processInBatches(items, batchSize, worker) {
+  const failures = [];
+
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const results = await Promise.allSettled(batch.map((item) => worker(item)));
+
+    results.forEach((result, index) => {
+      if (result.status === "rejected") {
+        failures.push({
+          id: batch[index]?.id ?? null,
+          name: batch[index]?.name ?? null,
+          message: String(result.reason?.message || result.reason || "").slice(0, 220),
+        });
+      }
+    });
+
+    if (i + batchSize < items.length) {
+      await sleep(350);
+    }
+  }
+
+  return failures;
+}
+
+async function stripEmergencyRolePermissions(role, reason) {
+  if (!role || role.id === role.guild.roles.everyone.id || role.managed || !role.editable) return false;
+
+  const nextPermissions = role.permissions.remove(
+    PermissionFlagsBits.Administrator,
+    PermissionFlagsBits.ManageGuild,
+    PermissionFlagsBits.ManageChannels,
+    PermissionFlagsBits.ManageRoles,
+    PermissionFlagsBits.ManageWebhooks,
+    PermissionFlagsBits.ManageMessages,
+    PermissionFlagsBits.ManageThreads,
+    PermissionFlagsBits.KickMembers,
+    PermissionFlagsBits.BanMembers,
+    PermissionFlagsBits.ModerateMembers,
+    PermissionFlagsBits.MentionEveryone,
+    PermissionFlagsBits.CreateInstantInvite
+  );
+
+  if (nextPermissions.bitfield === role.permissions.bitfield) return false;
+  await role.setPermissions(nextPermissions, reason);
+  return true;
+}
+
+async function applyEmergencyLockdownToChannel(channel, client, reason) {
+  if (!channel) return;
+
+  if (typeof channel.isThread === "function" && channel.isThread()) {
+    if (!channel.archived) {
+      await channel.setArchived(true, reason).catch(() => {});
+    }
+    if ("setLocked" in channel && !channel.locked) {
+      await channel.setLocked(true, reason).catch(() => {});
+    }
+    return;
+  }
+
+  if (!channel.permissionOverwrites || typeof channel.permissionOverwrites.edit !== "function") return;
+
+  const denyAccess = {
+    ViewChannel: false,
+    SendMessages: false,
+    AddReactions: false,
+    SendMessagesInThreads: false,
+    CreatePublicThreads: false,
+    CreatePrivateThreads: false,
+    AttachFiles: false,
+    EmbedLinks: false,
+    UseApplicationCommands: false,
+    CreateInstantInvite: false,
+    Connect: false,
+    Speak: false,
+    Stream: false,
+  };
+  const keepBotAccess = {
+    ViewChannel: true,
+    SendMessages: true,
+    ReadMessageHistory: true,
+    ManageChannels: true,
+    ManageMessages: true,
+    UseApplicationCommands: true,
+    Connect: true,
+    Speak: true,
+  };
+
+  const overwriteTargets = new Set([channel.guild.roles.everyone.id]);
+  for (const overwrite of channel.permissionOverwrites.cache.values()) {
+    if (overwrite.id === client.user.id) continue;
+    overwriteTargets.add(overwrite.id);
+  }
+
+  for (const targetId of overwriteTargets) {
+    await channel.permissionOverwrites.edit(targetId, denyAccess, { reason });
+  }
+
+  await channel.permissionOverwrites.edit(client.user.id, keepBotAccess, { reason });
+}
+
+async function kickEmergencyLockdownMember(guild, userId, requestedByUserId, reason) {
+  if (!userId) return { userId, status: "skipped", message: "missing user id" };
+  if (userId === requestedByUserId) return { userId, status: "skipped", message: "requester safeguard" };
+  if (userId === guild.ownerId) return { userId, status: "skipped", message: "guild owner safeguard" };
+  if (userId === guild.client.user.id) return { userId, status: "skipped", message: "bot safeguard" };
+
+  let member;
+  try {
+    member = await guild.members.fetch(userId);
+  } catch (err) {
+    const code = getDiscordErrorCode(err);
+    if (code === 10007) {
+      return { userId, status: "skipped", message: "member not found" };
+    }
+    throw err;
+  }
+
+  if (!member) return { userId, status: "skipped", message: "member not found" };
+  if (!member.kickable) return { userId, status: "failed", message: "member not kickable" };
+
+  await member.kick(reason);
+  return { userId, status: "kicked", message: "kicked" };
+}
+
+async function getEmergencyLockdownSelfCheck(guild, requestedByUserId) {
+  const me = guild.members.me || await guild.members.fetchMe();
+  const hasKickMembers = me.permissions.has(PermissionFlagsBits.KickMembers);
+  const hasManageChannels = me.permissions.has(PermissionFlagsBits.ManageChannels);
+  const hasManageRoles = me.permissions.has(PermissionFlagsBits.ManageRoles);
+  const selfHighestRolePosition = me.roles.highest?.position ?? 0;
+
+  const kickPreview = [];
+  for (const userId of EMERGENCY_LOCKDOWN_KICK_USER_IDS) {
+    if (!userId) continue;
+    if (userId === requestedByUserId) {
+      kickPreview.push({ userId, status: "skipped", message: "requester safeguard" });
+      continue;
+    }
+    if (userId === guild.ownerId) {
+      kickPreview.push({ userId, status: "skipped", message: "guild owner safeguard" });
+      continue;
+    }
+    if (userId === guild.client.user.id) {
+      kickPreview.push({ userId, status: "skipped", message: "bot safeguard" });
+      continue;
+    }
+
+    try {
+      const member = await guild.members.fetch(userId);
+      if (!member) {
+        kickPreview.push({ userId, status: "skipped", message: "member not found" });
+        continue;
+      }
+      if (!member.kickable) {
+        kickPreview.push({ userId, status: "blocked", message: "member not kickable" });
+        continue;
+      }
+      kickPreview.push({ userId, status: "kickable", message: "kickable" });
+    } catch (err) {
+      const code = getDiscordErrorCode(err);
+      if (code === 10007) {
+        kickPreview.push({ userId, status: "skipped", message: "member not found" });
+        continue;
+      }
+      kickPreview.push({
+        userId,
+        status: "unknown",
+        message: String(err?.message || err || "").slice(0, 180),
+      });
+    }
+  }
+
+  return {
+    hasKickMembers,
+    hasManageChannels,
+    hasManageRoles,
+    selfHighestRolePosition,
+    kickableTargets: kickPreview.filter((entry) => entry.status === "kickable").length,
+    blockedTargets: kickPreview.filter((entry) => entry.status === "blocked").length,
+    skippedTargets: kickPreview.filter((entry) => entry.status === "skipped").length,
+    unknownTargets: kickPreview.filter((entry) => entry.status === "unknown").length,
+    kickPreview,
+  };
+}
+
+function buildEmergencyLockdownPreflightLine(selfCheck) {
+  return (
+    `Preflight: Kick=${selfCheck.hasKickMembers ? "yes" : "no"}, ` +
+    `ManageChannels=${selfCheck.hasManageChannels ? "yes" : "no"}, ` +
+    `ManageRoles=${selfCheck.hasManageRoles ? "yes" : "no"}, ` +
+    `${selfCheck.kickableTargets} kickable, ${selfCheck.blockedTargets} blocked, ` +
+    `${selfCheck.skippedTargets} skipped` +
+    `${selfCheck.unknownTargets ? `, ${selfCheck.unknownTargets} unknown` : ""}.`
+  );
+}
+
+async function runEmergencyLockdown(client, requestedByUserId) {
+  if (emergencyLockdownInFlight) return emergencyLockdownInFlight;
+
+  emergencyLockdownInFlight = (async () => {
+    const guild = await client.guilds.fetch(EMERGENCY_LOCKDOWN_GUILD_ID);
+    await guild.channels.fetch();
+    await guild.roles.fetch();
+
+    const reason = `Owner-triggered emergency lockdown by ${requestedByUserId}`;
+    const backupPath = await writeEmergencyLockdownBackup(guild);
+    const selfCheck = await getEmergencyLockdownSelfCheck(guild, requestedByUserId);
+
+    const roles = Array.from(guild.roles.cache.values()).filter(
+      (role) => role.id !== guild.roles.everyone.id && !role.managed && role.editable
+    );
+    const channels = Array.from(guild.channels.cache.values());
+
+    const roleFailures = await processInBatches(
+      roles,
+      EMERGENCY_LOCKDOWN_ROLE_BATCH_SIZE,
+      (role) => stripEmergencyRolePermissions(role, reason)
+    );
+    const channelFailures = await processInBatches(
+      channels,
+      EMERGENCY_LOCKDOWN_CHANNEL_BATCH_SIZE,
+      (channel) => applyEmergencyLockdownToChannel(channel, client, reason)
+    );
+    const kickResults = [];
+    const kickFailures = await processInBatches(
+      EMERGENCY_LOCKDOWN_KICK_USER_IDS,
+      EMERGENCY_LOCKDOWN_KICK_BATCH_SIZE,
+      async (userId) => {
+        const result = await kickEmergencyLockdownMember(guild, userId, requestedByUserId, reason);
+        kickResults.push(result);
+      }
+    );
+    const kickedCount = kickResults.filter((entry) => entry?.status === "kicked").length;
+    const skippedKickCount = kickResults.filter((entry) => entry?.status === "skipped").length;
+    const failedKickResults = kickResults.filter((entry) => entry?.status === "failed");
+
+    auditLog("emergency_lockdown", {
+      requesterId: requestedByUserId,
+      guildId: guild.id,
+      backupPath,
+      rolesProcessed: roles.length,
+      channelsProcessed: channels.length,
+      botHasKickMembers: selfCheck.hasKickMembers,
+      botHasManageChannels: selfCheck.hasManageChannels,
+      botHasManageRoles: selfCheck.hasManageRoles,
+      preflightKickableTargets: selfCheck.kickableTargets,
+      preflightBlockedTargets: selfCheck.blockedTargets,
+      preflightSkippedTargets: selfCheck.skippedTargets,
+      preflightUnknownTargets: selfCheck.unknownTargets,
+      kickTargets: EMERGENCY_LOCKDOWN_KICK_USER_IDS.length,
+      kickedCount,
+      skippedKickCount,
+      kickFailures: kickFailures.length + failedKickResults.length,
+      roleFailures: roleFailures.length,
+      channelFailures: channelFailures.length,
+    });
+
+    return {
+      guild,
+      backupPath,
+      rolesProcessed: roles.length,
+      channelsProcessed: channels.length,
+      selfCheck,
+      kickTargets: EMERGENCY_LOCKDOWN_KICK_USER_IDS.length,
+      kickedCount,
+      skippedKickCount,
+      kickFailures: [...failedKickResults, ...kickFailures],
+      roleFailures,
+      channelFailures,
+    };
+  })().finally(() => {
+    emergencyLockdownInFlight = null;
+  });
+
+  return emergencyLockdownInFlight;
 }
 
 function getDiscordErrorCode(err) {
@@ -4685,24 +3713,6 @@ const reservationsCommand = new SlashCommandBuilder()
   .setName("reservations")
   .setDescription("Show the next reservation time for each title.");
 
-const remindCommand = new SlashCommandBuilder()
-  .setName("remind")
-  .setDescription("Create a manual reminder.");
-
-const listCommand = new SlashCommandBuilder()
-  .setName("list")
-  .setDescription("List outstanding reminders that haven't fired yet.");
-
-const purgeCommand = new SlashCommandBuilder()
-  .setName("purge")
-  .setDescription("Admin: purge stored reservation mappings and reminders.")
-  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-  .setDMPermission(false);
-
-const refreshCommand = new SlashCommandBuilder()
-  .setName("refresh")
-  .setDescription("Force a fresh pull from the sheet and update messages.");
-
 const statusCommand = new SlashCommandBuilder()
   .setName("status")
   .setDescription("Show bot health and integration status.");
@@ -4719,10 +3729,6 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
     spreadsheetCommand.toJSON(),
     timersCommand.toJSON(),
     reservationsCommand.toJSON(),
-    remindCommand.toJSON(),
-    listCommand.toJSON(),
-    purgeCommand.toJSON(),
-    refreshCommand.toJSON(),
     statusCommand.toJSON(),
     perfCommand.toJSON(),
   ];
@@ -4751,9 +3757,6 @@ client.once("clientReady", async () => {
   runtimeClient = client;
   startupStickyDelayUntil = Date.now() + 2 * 60_000;
   console.log(`🤖 Logged in as ${client.user.tag}`);
-  console.log(
-    `🔐 DM export owners: ${Array.from(DM_CHANNEL_EXPORT_OWNER_IDS).join(", ")}`
-  );
   scheduleHourlyRestart();
   await runStartupChecks(client);
   try {
@@ -4761,8 +3764,6 @@ client.once("clientReady", async () => {
   } catch (e) {
     console.error("❌ ensurePanel failed:", e);
   }
-  rehydrateReminders(client);
-  rehydrateManualReminders(client);
   startSnapshotRefreshLoop();
 
   for (const [channelId, entry] of timersMessageByChannel.entries()) {
@@ -4817,194 +3818,6 @@ client.once("clientReady", async () => {
   }
 });
 
-client.on("messageCreate", async (message) => {
-  try {
-    if (!message || message.author?.bot) return;
-    if (message.guildId) return;
-    if (!isAllowedDmUser(message.author.id)) return;
-
-    const content = String(message.content || "").trim();
-    if (/^stop$/i.test(content)) {
-      const cancelled = cancelDmExportSession(message.author.id);
-      await message.reply(cancelled ? "Stopping the active channel export." : "There is no active channel export to stop.");
-      return;
-    }
-
-    if (!content) {
-      await message.reply("Send `guild_id`, `guild_id \"cat\"`, `guild_id \"cat\" 10`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id 13:30 18/02/26 - 13:55 18/02/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
-      return;
-    }
-
-    const request = parseDmChannelRequest(content);
-    if (!request) {
-      await message.reply("Send `guild_id`, `guild_id \"cat\"`, `guild_id \"cat\" 10`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id 13:30 18/02/26 - 13:55 18/02/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
-      return;
-    }
-
-    if (request.type === "guild_search") {
-      const { guildId, searchTerm, count } = request;
-      let guild;
-      try {
-        guild = await client.guilds.fetch(guildId);
-      } catch {
-        await message.reply("I can't access that server. Make sure I'm in it and the ID is correct.");
-        return;
-      }
-
-      const existingSession = getActiveDmExport(message.author.id);
-      if (existingSession && !existingSession.cancelled) {
-        await message.reply("A search/export is already running. Send `stop` first if you want to cancel it.");
-        return;
-      }
-
-      const label = count
-        ? `most recent ${count} messages containing "${searchTerm}"`
-        : `all readable messages containing "${searchTerm}"`;
-      const session = startDmExportSession(message.author.id, `${guildId}:search`);
-      await message.reply(`Searching ${label} in ${guild.name}. Send \`stop\` to cancel.`);
-
-      try {
-        try {
-          await guild.channels.fetch();
-        } catch {}
-
-        const { matches, truncated } = await fetchGuildSearchMatches(guild, searchTerm, count, session);
-        if (session.cancelled) {
-          finishDmExportSession(message.author.id, session);
-          await message.author.send("Search stopped.");
-          return;
-        }
-
-        const transcript = buildGuildSearchTranscript(guild, matches, label, truncated);
-        const chunks = chunkText(transcript);
-        for (let i = 0; i < chunks.length; i += 1) {
-          if (session.cancelled) {
-            await message.author.send(`Search stopped after ${i} chunk${i === 1 ? "" : "s"}.`);
-            finishDmExportSession(message.author.id, session);
-            return;
-          }
-          await message.author.send(chunks[i]);
-          if (i < chunks.length - 1) {
-            await sleep(200);
-          }
-        }
-        finishDmExportSession(message.author.id, session);
-        await message.author.send(`Search complete. Sent ${chunks.length} chunk${chunks.length === 1 ? "" : "s"}.`);
-        return;
-      } catch (err) {
-        console.error("DM guild search failed:", err);
-        finishDmExportSession(message.author.id, session);
-        const code = getDiscordErrorCode(err);
-        const hint =
-          code === 50013 ? "Missing permissions (View Channel / Read Message History)." :
-          code === 50001 ? "Missing access to one of the channels." :
-          "";
-        await message.reply(`❌ Search failed. ${hint || "Check the logs for details."}`.trim());
-        return;
-      }
-    }
-
-    if (request.type === "channel_export") {
-      const { guildId, channelId, filter } = request;
-      let guild;
-      try {
-        guild = await client.guilds.fetch(guildId);
-      } catch {
-        await message.reply("I can't access that server. Make sure I'm in it and the ID is correct.");
-        return;
-      }
-
-      let channel;
-      try {
-        channel = await client.channels.fetch(channelId);
-      } catch {
-        await message.reply("I can't access that channel. Check the channel ID and my permissions.");
-        return;
-      }
-
-      if (!channel?.isTextBased?.() || !("messages" in channel)) {
-        await message.reply("That channel is not a text channel I can read.");
-        return;
-      }
-      if (channel.guildId !== guildId) {
-        await message.reply("That channel does not belong to the guild ID you sent.");
-        return;
-      }
-
-      const existingSession = getActiveDmExport(message.author.id);
-      if (existingSession && !existingSession.cancelled) {
-        await message.reply("A channel export is already running. Send `stop` first if you want to cancel it.");
-        return;
-      }
-
-      const session = startDmExportSession(message.author.id, `${guildId}:${channelId}`);
-      await message.reply(`Streaming ${filter.label} from #${channel.name || channel.id} in ${guild.name}. Send \`stop\` to cancel.`);
-      try {
-        const messages = await fetchChannelMessages(channel, filter, session);
-        if (session.cancelled) {
-          finishDmExportSession(message.author.id, session);
-          await message.author.send("Export stopped.");
-          return;
-        }
-        const transcript = buildChannelTranscript(guild, channel, messages, filter.label);
-        const chunks = chunkText(transcript);
-        for (let i = 0; i < chunks.length; i += 1) {
-          if (session.cancelled) {
-            await message.author.send(`Export stopped after ${i} chunk${i === 1 ? "" : "s"}.`);
-            finishDmExportSession(message.author.id, session);
-            return;
-          }
-          await message.author.send(chunks[i]);
-          if (i < chunks.length - 1) {
-            await sleep(200);
-          }
-        }
-        finishDmExportSession(message.author.id, session);
-        await message.author.send(`Export complete. Sent ${chunks.length} chunk${chunks.length === 1 ? "" : "s"}.`);
-        return;
-      } catch (err) {
-        console.error("DM export failed:", err);
-        finishDmExportSession(message.author.id, session);
-        const code = getDiscordErrorCode(err);
-        const hint =
-          code === 50013 ? "Missing permissions (View Channel / Read Message History)." :
-          code === 50001 ? "Missing access to that channel." :
-          code === 10003 ? "Unknown channel." :
-          "";
-        await message.reply(`❌ Export failed. ${hint || "Check the logs for details."}`.trim());
-        return;
-      }
-    }
-
-    const guildId = request.guildId;
-    let guild;
-    try {
-      guild = await client.guilds.fetch(guildId);
-    } catch {
-      await message.reply("I can't access that server. Make sure I'm in it and the ID is correct.");
-      return;
-    }
-
-    try {
-      await guild.channels.fetch();
-    } catch {}
-
-    const chunks = formatGuildChannelList(guild);
-    for (let i = 0; i < chunks.length; i += 1) {
-      if (i === 0) {
-        await message.reply(chunks[i]);
-      } else {
-        await message.author.send(chunks[i]);
-      }
-    }
-  } catch (err) {
-    console.error("DM channel lookup error:", err);
-    try {
-      await message.reply("❌ Something went wrong while listing channels.");
-    } catch {}
-  }
-});
-
 // =====================
 // INTERACTIONS
 // =====================
@@ -5034,7 +3847,6 @@ client.on("interactionCreate", async (interaction) => {
         id.startsWith("done_") ? "done" :
         id.startsWith("remind_") ? "remind" :
         id.startsWith("ping_") ? "ping" :
-        id.startsWith("manual_remind_cancel:") ? "remind" :
         (id.startsWith("remove_") || id.startsWith("remove_confirm_")) ? "remove" :
         null;
       const isRemoveConfirmClick = id.startsWith("remove_confirm_");
@@ -5095,98 +3907,9 @@ client.on("interactionCreate", async (interaction) => {
     // /spreadsheet
     if (interaction.isChatInputCommand() && interaction.commandName === "spreadsheet") {
       return interaction.reply({
-        content: "https://docs.google.com/spreadsheets/d/16dFXHy_ul9b97Yap5OU2jj5FcDxeU37YQeZg04IDVc8/edit?usp=sharing",
+        content: "https://docs.google.com/spreadsheets/d/1P8ZeMLRpwzg3wjaElc6OoUfnw6eUy6G8MT0TfCjWQZA/edit?gid=1555567410#gid=1555567410",
         flags: MessageFlags.Ephemeral,
       });
-    }
-
-    // /refresh
-    if (interaction.isChatInputCommand() && interaction.commandName === "refresh") {
-      if (!interaction.memberPermissions?.has("Administrator")) {
-        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "❌ You need Administrator to use this." });
-      }
-      try {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      } catch (e) {
-        if (isUnknownInteractionError(e)) return;
-        throw e;
-      }
-
-      const startedAt = Date.now();
-      const refreshPromise = (async () => {
-        resetTimersSnapshot("manual_refresh");
-        lastSnapshotReconcileAt = 0;
-        snapshotReconcileInFlight = false;
-        pendingSnapshotReconcile = null;
-        let ok = false;
-        try {
-          const text = await fetchTimersText();
-          ok = !!text;
-        } catch (e) {
-          console.error("manual refresh failed:", e);
-        }
-
-        try {
-        if (timersSnapshot?.rowStates) {
-          // Force a reconcile even if a previous loop got stuck.
-          reservationStateSyncInFlight = false;
-          await reconcileReservationState(timersSnapshot.rowStates);
-        }
-          if (timersSnapshot?.activeSerials) {
-            await reconcileDeletedReservations(timersSnapshot.activeSerials);
-          }
-        } catch (e) {
-          console.error("manual refresh reconcile failed:", e);
-        }
-
-        try {
-          await updateAllTimersMessages(client);
-          await updateAllReservationsMessages(client);
-        } catch (e) {
-          console.error("manual refresh update failed:", e);
-        }
-
-        const tookMs = Date.now() - startedAt;
-        const source = SHEETDB_URL ? "SheetDB" : "Apps Script";
-        return { ok, tookMs, source };
-      })();
-
-      const timeoutMs = 5000;
-      const timed = await Promise.race([
-        refreshPromise,
-        sleep(timeoutMs).then(() => ({ timeout: true })),
-      ]);
-
-      if (timed?.timeout) {
-        await interaction.editReply("⏳ Refresh running… I’ll post a result shortly.");
-        const maxWaitMs = 20_000;
-        Promise.race([
-          refreshPromise,
-          sleep(maxWaitMs).then(() => ({ timeout: true })),
-        ])
-          .then((result) => {
-            if (result?.timeout) {
-              return interaction.followUp({
-                flags: MessageFlags.Ephemeral,
-                content: "❌ Refresh timed out. Check Apps Script availability and try again.",
-              });
-            }
-            if (!result?.ok) {
-              return interaction.followUp({ flags: MessageFlags.Ephemeral, content: "❌ Refresh failed (check logs)." });
-            }
-            return interaction.followUp({
-              flags: MessageFlags.Ephemeral,
-              content: `✅ Refreshed from ${result.source} in ${result.tookMs}ms.`,
-            });
-          })
-          .catch(() => {});
-        return;
-      }
-
-      if (!timed?.ok) {
-        return interaction.editReply("❌ Refresh failed (check logs).");
-      }
-      return interaction.editReply(`✅ Refreshed from ${timed.source} in ${timed.tookMs}ms.`);
     }
 
     // /status
@@ -5265,93 +3988,6 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // /remind
-    if (interaction.isChatInputCommand() && interaction.commandName === "remind") {
-      remindDraftByUser.set(interaction.user.id, {
-        username: "",
-        titleValue: "",
-        titleLabel: "",
-        timeInput: "",
-        channelId: interaction.channelId,
-        guildId: interaction.guildId,
-        ts: Date.now(),
-        responseToken: interaction.token || null,
-        responseMessageId: null,
-      });
-      const reply = await interaction.reply({
-        flags: MessageFlags.Ephemeral,
-        content: buildRemindSetupMessage(),
-        components: buildRemindSetupComponents(),
-        fetchReply: true,
-      });
-      const existing = remindDraftByUser.get(interaction.user.id) || {};
-      remindDraftByUser.set(interaction.user.id, {
-        ...existing,
-        responseMessageId: reply?.id || existing.responseMessageId || null,
-      });
-      scheduleEphemeralDelete(reply, interaction.token, true);
-      return;
-    }
-
-    // /list
-    if (interaction.isChatInputCommand() && interaction.commandName === "list") {
-      const items = collectOutstandingReminders();
-      if (!items.length) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: "No outstanding reminders.",
-        });
-      }
-      const lines = items.slice(0, 40).map((item) => {
-        const stamp = Math.floor(item.remindAtMs / 1000);
-        return `${item.username}, ${item.title}, <t:${stamp}:F>`;
-      });
-      const extra = items.length > 40 ? `\n…and ${items.length - 40} more.` : "";
-      return interaction.reply({
-        flags: MessageFlags.Ephemeral,
-        content: `\u200b\n${lines.join("\n").slice(0, 1900)}${extra}`,
-      });
-    }
-
-    // /purge
-    if (interaction.isChatInputCommand() && interaction.commandName === "purge") {
-      if (!interaction.memberPermissions?.has("Administrator")) {
-        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "❌ You need Administrator to use this." });
-      }
-
-      try {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      } catch (e) {
-        if (isUnknownInteractionError(e)) return;
-        throw e;
-      }
-
-      const ownersCount = reservationOwners.size;
-      const messagesCount = reservationMessages.size;
-      const reminderMetaCount = reminderMeta.size;
-      const reminderStoreCount = Object.keys(remindersStore).length;
-
-      for (const t of reminderTimers.values()) clearTimeout(t);
-      reminderTimers.clear();
-      reminderMeta.clear();
-      for (const key of Object.keys(remindersStore)) delete remindersStore[key];
-      persistRemindersStore();
-
-      reservationOwners.clear();
-      persistReservationOwners();
-      reservationMessages.clear();
-      persistReservationMessages();
-      orphanDeletionCandidates.clear();
-
-      return interaction.editReply(
-        `✅ Purged mappings and reminders.\n` +
-          `Owners cleared: ${ownersCount}\n` +
-          `Messages cleared: ${messagesCount}\n` +
-          `Reminder meta cleared: ${reminderMetaCount}\n` +
-          `Reminder store cleared: ${reminderStoreCount}`
-      );
-    }
-
     // timezone picker select (IANA)
     if (interaction.isStringSelectMenu() && interaction.customId === "select_timezone_iana") {
       const zone = interaction.values?.[0];
@@ -5396,33 +4032,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // /remind title select
-    if (interaction.isStringSelectMenu() && interaction.customId === "remind_title_select") {
-      const picked = interaction.values?.[0];
-      const t = TITLES.find((x) => x.value === picked);
-      const existing = remindDraftByUser.get(interaction.user.id) || {};
-      remindDraftByUser.set(interaction.user.id, {
-        ...existing,
-        titleValue: picked || "",
-        titleLabel: t?.label ?? picked ?? "",
-        channelId: interaction.channelId,
-        guildId: interaction.guildId,
-        ts: Date.now(),
-      });
-      const updated = await interaction.update({
-        content: buildRemindSetupMessage(remindDraftByUser.get(interaction.user.id)),
-        components: buildRemindSetupComponents(),
-        fetchReply: true,
-      });
-      const latest = remindDraftByUser.get(interaction.user.id) || {};
-      remindDraftByUser.set(interaction.user.id, {
-        ...latest,
-        responseMessageId: updated?.id || latest.responseMessageId || null,
-      });
-      scheduleEphemeralDelete(updated, interaction.token, true);
-      return;
-    }
-
     // reservations panel
     if (
       interaction.isButton() &&
@@ -5447,20 +4056,16 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`❌ Could not fetch reservations${js?.message ? `: ${js.message}` : "."}`);
       }
 
+      const allItems = Array.isArray(js.reservations) ? js.reservations : [];
+      const items = allItems.filter((r) => {
+        const serial = r?.serial ?? r?.row;
+        return getReservationOwner(serial) === discordId;
+      });
       const rowStateBySerial = new Map(
         (Array.isArray(timersSnapshot?.rowStates) ? timersSnapshot.rowStates : [])
           .map((rowState) => [String(rowState?.serial || ""), rowState])
           .filter(([serial]) => !!serial)
       );
-      const allItems = Array.isArray(js.reservations) ? js.reservations : [];
-      const nowMs = Date.now();
-      const items = allItems.filter((r) => {
-        const serial = r?.serial ?? r?.row;
-        if (getReservationOwner(serial) !== discordId) return false;
-        const rowState = rowStateBySerial.get(String(serial));
-        const merged = mergeReservationForCheck(r, rowState);
-        return !shouldHideReservationFromCheck(merged, nowMs);
-      });
       for (const item of items) {
         const serial = String(item?.serial ?? item?.row ?? "");
         if (!serial) continue;
@@ -5482,9 +4087,8 @@ client.on("interactionCreate", async (interaction) => {
         if (bySerial.has(serial)) continue;
         if (getReservationOwner(serial) !== discordId) continue;
         if (!!rowState.done) continue;
-        const reservationUtc = normalizeReservationDisplay(rowState.reservationUtc);
-        if (!isReservationMissing(reservationUtc)) continue;
-        if (shouldHideReservationFromCheck(rowState, nowMs)) continue;
+        const reservationUtc = String(rowState.reservationUtc || "—").trim() || "—";
+        if (reservationUtc !== "—") continue;
         bySerial.set(serial, {
           serial,
           title: rowState.title,
@@ -5507,9 +4111,9 @@ client.on("interactionCreate", async (interaction) => {
 
       const lines = mergedItems.slice(0, 25).map((r) => {
         const title = String(r.title || "Title");
-        const reservationUtc = normalizeReservationDisplay(r.reservationUtc);
+        const reservationUtc = String(r.reservationUtc || "—").trim() || "—";
         const tz = getUserTimezone(interaction.user.id);
-        if (!isAsapOrMissingReservation(reservationUtc)) {
+        if (reservationUtc !== "—") {
           return {
             username: getReservationUsername(r),
             line: `${title} — ${formatReservationForUserTimezone(reservationUtc, tz)}`,
@@ -5609,134 +4213,6 @@ client.on("interactionCreate", async (interaction) => {
         }
       }, 0);
       return;
-    }
-
-    // /remind details modal submit
-    if (interaction.isModalSubmit() && interaction.customId === "remind_details_modal") {
-      const username = String(interaction.fields.getTextInputValue("remind_username") || "").trim();
-      const timeInput = String(interaction.fields.getTextInputValue("remind_time") || "").trim();
-      const existing = remindDraftByUser.get(interaction.user.id) || {};
-      remindDraftByUser.set(interaction.user.id, {
-        ...existing,
-        username,
-        timeInput,
-        channelId: interaction.channelId || existing.channelId,
-        guildId: interaction.guildId || existing.guildId,
-        ts: Date.now(),
-      });
-      const updatedDraft = remindDraftByUser.get(interaction.user.id) || {};
-      if (updatedDraft.responseToken && updatedDraft.responseMessageId) {
-        try {
-          await rest.patch(
-            Routes.webhookMessage(CLIENT_ID, updatedDraft.responseToken, updatedDraft.responseMessageId),
-            {
-              body: {
-                content: buildRemindSetupMessage(updatedDraft),
-                components: buildRemindSetupComponents(),
-              },
-            }
-          );
-        } catch (e) {
-          console.error("Failed to update remind setup message:", e);
-        }
-      }
-      const reply = await interaction.reply({
-        flags: MessageFlags.Ephemeral,
-        content: "✅ Details saved. Click Done in the reminder box to set the reminder.",
-        fetchReply: true,
-      });
-      scheduleEphemeralDelete(reply, interaction.token, true);
-      return;
-    }
-
-    // remind-in details modal submit
-    if (interaction.isModalSubmit() && interaction.customId.startsWith("remind_in_details_modal:")) {
-      const rowSerial = interaction.customId.split(":")[1];
-      const key = `${interaction.user.id}:${rowSerial}`;
-      const draft = remindInDraftByUser.get(key);
-      if (!draft || !rowSerial) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: "❌ That reminder setup expired. Please click Remind In again.",
-        });
-      }
-
-      const username = String(interaction.fields.getTextInputValue("remind_in_username") || "").trim();
-      const timeInput = String(interaction.fields.getTextInputValue("remind_in_time") || "").trim();
-      const tz = getUserTimezone(interaction.user.id);
-      const parsed = parseReminderDateTime(timeInput, tz);
-      if (parsed?.error) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: `❌ ${parsed.error}`,
-        });
-      }
-
-      const reminderUtc = new Date(parsed.remindAtMs);
-      const discordMention = draft.ownerUserId ? `<@${draft.ownerUserId}>` : null;
-
-      scheduleReminder({
-        client,
-        rowSerial,
-        reservationUtc: reminderUtc,
-        channelId: draft.channelId || interaction.channelId,
-        sourceMessageUrl: draft.sourceMessageUrl || null,
-        title: draft.title || "Title",
-        username: username || draft.username || "Username",
-        coordinates: draft.coordinates || "—",
-        discordMention,
-        reservationStr: "",
-        kind: "custom",
-      });
-
-      // Update original message to show Cancel Remind
-      if (draft.channelId && draft.messageId) {
-        try {
-          const ch = await client.channels.fetch(draft.channelId);
-          if (ch?.isTextBased()) {
-            const msg = await ch.messages.fetch(draft.messageId);
-            const completed = getCompletedFromEmbed(msg);
-            const pingUserId = resolvePingUserId(msg, rowSerial);
-            const reservationStr = getReservationFromEmbed(msg);
-            const updatedRow = buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, !isPingHidden(rowSerial));
-            await msg.edit({ components: [updatedRow] });
-          }
-        } catch (e) {
-          console.error("Failed to update Remind In button:", e);
-        }
-      }
-
-      remindInDraftByUser.delete(key);
-      auditLog("remind_in_arm", {
-        userId: interaction.user.id,
-        rowSerial,
-        remindAtMs: parsed.remindAtMs,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      const stamp = Math.floor(parsed.remindAtMs / 1000);
-      const reply = await interaction.reply({
-        flags: MessageFlags.Ephemeral,
-        content: `✅ Reminder set for ${username || draft.username || "Username"} for ${draft.title || "Title"}, <t:${stamp}:F>.`,
-      });
-
-      const targetChannelId = REMINDER_CHANNEL_ID || draft.channelId;
-      if (targetChannelId) {
-        try {
-          const ch = await client.channels.fetch(targetChannelId);
-          if (ch?.isTextBased()) {
-            const jump = draft.sourceMessageUrl ? `\n${draft.sourceMessageUrl}` : "";
-            await ch.send({
-              content: `✅ Reminder set for ${username || draft.username || "Username"} for ${draft.title || "Title"}, <t:${stamp}:F>. Row #${rowSerial}${jump}`,
-              components: [buildCustomReminderCancelRow(rowSerial)],
-            });
-          }
-        } catch (e) {
-          console.error("Failed to post remind-in announcement:", e);
-        }
-      }
-      return reply;
     }
 
     // modal submit -> submit -> post in FORM channel
@@ -5858,7 +4334,7 @@ client.on("interactionCreate", async (interaction) => {
       const displayDiscordUsername = `${interaction.user.username}${isTestUsername ? ` ${TEST_DISCORD_SUFFIX_EMOJI}` : ""}`;
 
       const embed = new EmbedBuilder()
-        .setTitle("📋 New Title Request")
+        .setTitle(isTestUsername ? "📋 TEST" : "📋 New Title Request")
         .addFields(
           { name: "👤 Discord", value: displayDiscordUsername, inline: true },
           { name: "🎮 Username", value: username, inline: true },
@@ -5881,12 +4357,7 @@ client.on("interactionCreate", async (interaction) => {
       if (guardianMention && !isTestUsername) contentParts.push(guardianMention);
       const content = contentParts.length ? contentParts.join(" ") : undefined;
 
-      const sentFormMessage = await formChannel.send({
-        content,
-        embeds: [embed],
-        components: [actionRow],
-        flags: isTestUsername ? MessageFlags.SuppressNotifications : undefined,
-      });
+      const sentFormMessage = await formChannel.send({ content, embeds: [embed], components: [actionRow] });
       setReservationRequestMessage(rowSerial, sentFormMessage.channelId, sentFormMessage.id, interaction.guildId);
       auditLog("form_submit", {
         userId: interaction.user.id,
@@ -6004,180 +4475,13 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply("✅ Reservation removed.");
     }
 
-    // /remind edit details -> modal
-    if (interaction.isButton() && interaction.customId === "remind_edit_details") {
-      const draft = remindDraftByUser.get(interaction.user.id) || {};
-      const tz = getUserTimezone(interaction.user.id);
-      const tzLabel = tz ? getTimezoneLabel(tz) : "UTC";
-      try {
-        return await interaction.showModal(buildRemindDetailsModal(draft, tzLabel));
-      } catch (e) {
-        if (isUnknownInteractionError(e)) return;
-        throw e;
-      }
-    }
+    // 🛑 Cancel Remind
+    if (interaction.isButton() && interaction.customId.startsWith("remind_cancel_")) {
+      const rowSerial = interaction.customId.split("_")[2];
 
-    // /remind done
-    if (interaction.isButton() && interaction.customId === "remind_done") {
-      const draft = remindDraftByUser.get(interaction.user.id) || {};
-      const missing = [];
-      if (!String(draft.titleValue || "").trim()) missing.push("Title");
-      if (!String(draft.username || "").trim()) missing.push("Username");
-      if (!String(draft.timeInput || "").trim()) missing.push("Time");
-      if (missing.length) {
-        const reply = await interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: `❌ Missing: ${missing.join(", ")}.`,
-          fetchReply: true,
-        });
-        scheduleEphemeralDelete(reply, interaction.token, true);
-        return;
-      }
-
-      const tz = getUserTimezone(interaction.user.id);
-      const parsed = parseReminderDateTime(draft.timeInput, tz);
-      if (parsed?.error) {
-        const reply = await interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: `❌ ${parsed.error}`,
-          fetchReply: true,
-        });
-        scheduleEphemeralDelete(reply, interaction.token, true);
-        return;
-      }
-
-      const reminderId = `manual_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-      const entry = {
-        id: reminderId,
-        remindAtMs: parsed.remindAtMs,
-        channelId: draft.channelId || interaction.channelId,
-        guildId: draft.guildId || interaction.guildId,
-        username: String(draft.username).trim(),
-        title: String(draft.titleLabel || draft.titleValue || "").trim(),
-        createdBy: interaction.user.id,
-        createdAtMs: Date.now(),
-        announceMessageId: null,
-        announceChannelId: null,
-      };
-      setManualReminderStoreEntry(reminderId, entry);
-      scheduleManualReminder(client, entry);
-      remindDraftByUser.delete(interaction.user.id);
-
-      const stamp = Math.floor(parsed.remindAtMs / 1000);
-      try {
-        await interaction.deferUpdate();
-      } catch {}
-      try {
-        await interaction.deleteReply();
-      } catch {
-        try {
-          if (interaction.message?.deletable) {
-            await interaction.message.delete();
-          }
-        } catch {}
-      }
-      const follow = await interaction.followUp({
-        content: `✅ Reminder set for ${entry.username} for ${entry.title}, <t:${stamp}:F>.`,
-        components: [buildManualReminderCancelRow(reminderId)],
-        fetchReply: true,
-      });
-      if (follow?.id) {
-        entry.announceMessageId = follow.id;
-        entry.announceChannelId = follow.channelId || entry.channelId;
-        setManualReminderStoreEntry(reminderId, entry);
-      }
-      return;
-    }
-
-    // manual reminder cancel
-    if (interaction.isButton() && interaction.customId.startsWith("manual_remind_cancel:")) {
-      const reminderId = interaction.customId.slice("manual_remind_cancel:".length);
-      if (!reminderId) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: "⚠️ That reminder no longer exists.",
-        });
-      }
-      const entry = manualReminderStore[String(reminderId)];
-      if (!entry) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: "⚠️ That reminder no longer exists.",
-        });
-      }
-      if (String(entry.createdBy || "") !== String(interaction.user.id)) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: "❌ Only the creator can cancel this reminder.",
-        });
-      }
-
-      if (manualReminderTimers.has(String(reminderId))) {
-        clearTimeout(manualReminderTimers.get(String(reminderId)));
-        manualReminderTimers.delete(String(reminderId));
-      }
-      clearManualReminderStoreEntry(reminderId);
-
-      try {
-        await interaction.message?.delete?.();
-      } catch {}
-
-      return interaction.reply({
-        flags: MessageFlags.Ephemeral,
-        content: "✅ Reminder cancelled.",
-      });
-    }
-
-    // custom remind-in cancel (reminder channel announcement)
-    if (interaction.isButton() && interaction.customId.startsWith("custom_remind_cancel:")) {
-      const rowSerial = interaction.customId.slice("custom_remind_cancel:".length);
-      if (!rowSerial) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: "⚠️ That reminder no longer exists.",
-        });
-      }
-
+      // Use deferUpdate so we can also edit message buttons
       await interaction.deferUpdate();
-      const metaBeforeCancel = reminderMeta.get(String(rowSerial)) || {};
-      cancelReminder(rowSerial);
 
-      if (metaBeforeCancel?.sourceUrl) {
-        try {
-          await updateOriginalRequestFromSourceUrl(client, metaBeforeCancel.sourceUrl, rowSerial);
-        } catch (e) {
-          console.error("updateOriginalRequestFromSourceUrl error:", e);
-        }
-      }
-
-      try {
-        await interaction.message?.delete?.();
-      } catch {}
-
-      auditLog("remind_cancel", {
-        userId: interaction.user.id,
-        rowSerial,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        success: true,
-      });
-      return interaction.followUp({
-        flags: MessageFlags.Ephemeral,
-        content: "✅ Reminder cancelled.",
-      });
-    }
-
-    // reminder-channel announce cancel (regular remind)
-    if (interaction.isButton() && interaction.customId.startsWith("announce_remind_cancel:")) {
-      const rowSerial = interaction.customId.slice("announce_remind_cancel:".length);
-      if (!rowSerial) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: "⚠️ That reminder no longer exists.",
-        });
-      }
-
-      await interaction.deferUpdate();
       const metaBeforeCancel = reminderMeta.get(String(rowSerial)) || {};
       cancelReminder(rowSerial);
 
@@ -6190,99 +4494,6 @@ client.on("interactionCreate", async (interaction) => {
       }
       if (clearJson && !clearJson.success) {
         console.error("clear_remind failed:", clearJson);
-      }
-
-      if (metaBeforeCancel?.sourceUrl) {
-        try {
-          await updateOriginalRequestFromSourceUrl(client, metaBeforeCancel.sourceUrl, rowSerial);
-        } catch (e) {
-          console.error("updateOriginalRequestFromSourceUrl error:", e);
-        }
-      }
-
-      try {
-        await interaction.message?.delete?.();
-      } catch {}
-
-      const cancelMessage = clearJson && clearJson.success
-        ? "✅ Reminder cancelled."
-        : "⚠️ Reminder cancelled, but I couldn't clear the sheet. Check Apps Script logs.";
-      auditLog("remind_cancel", {
-        userId: interaction.user.id,
-        rowSerial,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        success: !!(clearJson && clearJson.success),
-      });
-      return interaction.followUp({
-        flags: MessageFlags.Ephemeral,
-        content: cancelMessage,
-      });
-    }
-
-    // 🕒 Remind In (custom time for no-reservation forms)
-    if (interaction.isButton() && interaction.customId.startsWith("remind_in_")) {
-      const rowSerial = interaction.customId.split("_")[2];
-      const title = getTitleFromEmbed(interaction.message) || "Title";
-      const username = getUsernameFromEmbed(interaction.message) || "Username";
-      const coordinates = getCoordinatesFromEmbed(interaction.message) || "—";
-      const ownerUserId = resolvePingUserId(interaction.message, rowSerial);
-      const reservationStr = normalizeReservationDisplay(getReservationFromEmbed(interaction.message));
-      if (!isAsapOrMissingReservation(reservationStr)) {
-        return interaction.reply({
-          flags: MessageFlags.Ephemeral,
-          content: "❌ This request already has a reservation time. Use ⏰ Remind instead.",
-        });
-      }
-      const tz = getUserTimezone(interaction.user.id);
-      const tzLabel = tz ? getTimezoneLabel(tz) : "UTC";
-
-      const key = `${interaction.user.id}:${rowSerial}`;
-      remindInDraftByUser.set(key, {
-        rowSerial,
-        title,
-        username,
-        coordinates,
-        channelId: interaction.channelId,
-        guildId: interaction.guildId,
-        messageId: interaction.message?.id || null,
-        reservationStr,
-        ownerUserId,
-        sourceMessageUrl: interaction.message?.url || null,
-        ts: Date.now(),
-      });
-
-      try {
-        return await interaction.showModal(buildRemindInDetailsModal(rowSerial, { username }, tzLabel));
-      } catch (e) {
-        if (isUnknownInteractionError(e)) return;
-        throw e;
-      }
-    }
-
-    // 🛑 Cancel Remind
-    if (interaction.isButton() && interaction.customId.startsWith("remind_cancel_")) {
-      const rowSerial = interaction.customId.split("_")[2];
-
-      // Use deferUpdate so we can also edit message buttons
-      await interaction.deferUpdate();
-
-      const metaBeforeCancel = reminderMeta.get(String(rowSerial)) || {};
-      const storeBeforeCancel = getReminderStoreEntry(rowSerial);
-      const isCustomReminder = metaBeforeCancel.kind === "custom" || storeBeforeCancel?.kind === "custom";
-      cancelReminder(rowSerial);
-
-      // Clear Remind At in sheet
-      if (!isCustomReminder) {
-        let clearJson = null;
-        try {
-          clearJson = await postToAppsScript({ action: "clear_remind", rowSerial });
-        } catch (e) {
-          console.error("clear_remind -> Apps Script error:", e);
-        }
-        if (clearJson && !clearJson.success) {
-          console.error("clear_remind failed:", clearJson);
-        }
       }
 
       const completed = getCompletedFromEmbed(interaction.message);
@@ -6375,20 +4586,6 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         await pingChannel.send(`${mention} ${title} is on ${username}! Please refresh your game.`);
-
-        const mainPingChannelId = PING_CHANNEL_ID ? String(PING_CHANNEL_ID) : null;
-        const shouldSendToMain =
-          mainPingChannelId &&
-          mainPingChannelId !== String(targetPingChannelId) &&
-          (originGuildId ? true : false);
-        if (shouldSendToMain) {
-          const mainChannel = await client.channels.fetch(mainPingChannelId);
-          if (mainChannel?.isTextBased()) {
-            await mainChannel.send(`${title} is on ${username}!`);
-          } else {
-            console.error("Main ping channel is not text based:", mainPingChannelId);
-          }
-        }
         auditLog("ping_sent", {
           userId: interaction.user.id,
           rowSerial,
@@ -6409,17 +4606,12 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     // ⏰ Remind (arm)
-    if (
-      interaction.isButton() &&
-      interaction.customId.startsWith("remind_") &&
-      !interaction.customId.startsWith("remind_in_") &&
-      !interaction.customId.startsWith("remind_cancel_")
-    ) {
+    if (interaction.isButton() && interaction.customId.startsWith("remind_")) {
       const rowSerial = interaction.customId.split("_")[1];
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-      const reservationStr = normalizeReservationDisplay(getReservationFromEmbed(interaction.message));
-      if (isReservationMissing(reservationStr)) {
+      const reservationStr = getReservationFromEmbed(interaction.message);
+      if (!reservationStr || String(reservationStr).trim() === "" || reservationStr === "—") {
         return interaction.editReply("❌ This request has no reservation time to remind for.");
       }
 
@@ -6483,23 +4675,6 @@ client.on("interactionCreate", async (interaction) => {
         guildId: interaction.guildId,
         channelId: interaction.channelId,
       });
-
-      const stamp = Math.floor(reservationUtc.getTime() / 1000);
-      const targetChannelId = REMINDER_CHANNEL_ID || interaction.channelId;
-      if (targetChannelId) {
-        try {
-          const ch = await client.channels.fetch(targetChannelId);
-          if (ch?.isTextBased()) {
-            const jump = interaction.message?.url ? `\n${interaction.message.url}` : "";
-            await ch.send({
-              content: `✅ Reminder set for ${username} for ${title}, <t:${stamp}:F>. Row #${rowSerial}${jump}`,
-              components: [buildAnnounceReminderCancelRow(rowSerial)],
-            });
-          }
-        } catch (e) {
-          console.error("Failed to post remind announcement:", e);
-        }
-      }
 
       return interaction.editReply(`✅ Reminder armed for **${reservationStr}** (UTC).`);
     }
@@ -6576,7 +4751,7 @@ client.on("interactionCreate", async (interaction) => {
         const reminderFired = !!reminderMetaEntry?.fired;
 
         // Always cancel timer locally, then persist done+reminder state in sheet.
-        cancelReminder(rowSerial, { keepMetaIfFired: true });
+        cancelReminder(rowSerial, true);
 
         let json;
         try {
@@ -6669,56 +4844,75 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-client.on("error", (err) => console.error("Discord client error:", err));
-process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
-
-if (pm2io && typeof pm2io.action === "function") {
-  pm2io.action("timezone", (data, reply) => {
-    const responder = typeof reply === "function" ? reply : data;
-    try {
-      const raw =
-        typeof reply === "function"
-          ? data
-          : responder?.args ?? responder?.body ?? responder;
-      let userId = "";
-      if (Array.isArray(raw)) {
-        userId = String(raw[0] ?? "").trim();
-      } else if (raw && typeof raw === "object") {
-        userId = String(raw.userId ?? raw.id ?? raw.args?.[0] ?? "").trim();
-      } else if (raw != null) {
-        userId = String(raw).trim();
-      }
-      if (!userId) {
-        responder({ ok: false, error: "missing_user_id" });
-        return;
-      }
-      const tz = readJsonSafe(TZ_STORE_PATH, {})[userId] || null;
-      responder({ ok: true, userId, timezone: tz });
-    } catch (e) {
-      responder({ ok: false, error: "lookup_failed" });
-    }
-  });
-}
-
-process.on("message", (packet) => {
+client.on("messageCreate", async (message) => {
   try {
-    if (!packet || packet.type !== "process:msg") return;
-    const data = packet.data || {};
-    if (data.action !== "timezone") return;
-    const userId = String(data.userId || data.user || "").trim();
-    const tz = userId ? readJsonSafe(TZ_STORE_PATH, {})[userId] : null;
-    const payload = {
-      action: "timezone",
-      userId,
-      timezone: tz || null,
-    };
-    if (typeof process.send === "function") {
-      process.send({ type: "process:msg", data: payload });
+    if (message.author?.bot) return;
+    if (message.author?.id !== EMERGENCY_LOCKDOWN_OWNER_ID) return;
+    if (message.inGuild()) return;
+    const normalizedContent = String(message.content || "").trim().toLowerCase();
+    if (normalizedContent !== EMERGENCY_LOCKDOWN_TRIGGER && normalizedContent !== EMERGENCY_LOCKDOWN_PREFLIGHT_TRIGGER) {
+      return;
     }
-  } catch (e) {
-    console.error("pm2 trigger timezone error:", e);
+
+    if (normalizedContent === EMERGENCY_LOCKDOWN_PREFLIGHT_TRIGGER) {
+      const guild = await client.guilds.fetch(EMERGENCY_LOCKDOWN_GUILD_ID);
+      const selfCheck = await getEmergencyLockdownSelfCheck(guild, message.author.id);
+      const preflightLine = buildEmergencyLockdownPreflightLine(selfCheck);
+      auditLog("emergency_lockdown_preflight", {
+        requesterId: message.author.id,
+        guildId: guild.id,
+        botHasKickMembers: selfCheck.hasKickMembers,
+        botHasManageChannels: selfCheck.hasManageChannels,
+        botHasManageRoles: selfCheck.hasManageRoles,
+        preflightKickableTargets: selfCheck.kickableTargets,
+        preflightBlockedTargets: selfCheck.blockedTargets,
+        preflightSkippedTargets: selfCheck.skippedTargets,
+        preflightUnknownTargets: selfCheck.unknownTargets,
+      });
+      await message.reply(
+        `${preflightLine}\nReady check complete for **${guild.name}**. No changes were made.`
+      );
+      return;
+    }
+
+    if (emergencyLockdownInFlight) {
+      await message.reply("Emergency lockdown is already running.");
+      return;
+    }
+
+    await message.reply(`Starting emergency lockdown for guild ${EMERGENCY_LOCKDOWN_GUILD_ID}.`);
+    const result = await runEmergencyLockdown(client, message.author.id);
+
+    const warningParts = [];
+    if (result.roleFailures.length) warningParts.push(`${result.roleFailures.length} role updates failed`);
+    if (result.channelFailures.length) warningParts.push(`${result.channelFailures.length} channel updates failed`);
+    if (result.kickFailures.length) warningParts.push(`${result.kickFailures.length} kicks failed`);
+    const warningSuffix = warningParts.length ? ` Warnings: ${warningParts.join(", ")}.` : "";
+    const preflightLine = buildEmergencyLockdownPreflightLine(result.selfCheck);
+
+    await message.channel.send(
+      `${preflightLine}\n` +
+      `Emergency lockdown finished for **${result.guild.name}**. Backup saved to \`${path.basename(result.backupPath)}\`. ` +
+      `${result.channelsProcessed} channels processed, ${result.rolesProcessed} roles processed, ` +
+      `${result.kickedCount}/${result.kickTargets} listed users kicked` +
+      `${result.skippedKickCount ? `, ${result.skippedKickCount} skipped` : ""}.` +
+      `${warningSuffix}`
+    );
+  } catch (err) {
+    console.error("Emergency lockdown failed:", err);
+    auditLog("emergency_lockdown_failed", {
+      requesterId: message.author?.id || null,
+      guildId: EMERGENCY_LOCKDOWN_GUILD_ID,
+      message: String(err?.message || err || "").slice(0, 300),
+    });
+    try {
+      await message.reply(`Emergency lockdown failed: ${String(err?.message || "unknown error").slice(0, 180)}`);
+    } catch {}
   }
 });
+
+client.on("error", (err) => console.error("Discord client error:", err));
+process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
 
