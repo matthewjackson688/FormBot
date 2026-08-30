@@ -5095,7 +5095,7 @@ client.on("interactionCreate", async (interaction) => {
     // /spreadsheet
     if (interaction.isChatInputCommand() && interaction.commandName === "spreadsheet") {
       return interaction.reply({
-        content: "https://docs.google.com/spreadsheets/d/16dFXHy_ul9b97Yap5OU2jj5FcDxeU37YQeZg04IDVc8/edit?usp=sharing",
+        content: "https://docs.google.com/spreadsheets/d/1P8ZeMLRpwzg3wjaElc6OoUfnw6eUy6G8MT0TfCjWQZA/edit?usp=sharing",
         flags: MessageFlags.Ephemeral,
       });
     }
@@ -6721,3 +6721,4 @@ process.on("message", (packet) => {
 });
 
 client.login(DISCORD_TOKEN);
+
