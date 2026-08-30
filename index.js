@@ -4003,22 +4003,26 @@ function formatUtcOffsetLabel(offsetMinutes) {
 }
 
 function getTimezoneLabel(tz) {
-  if (!tz) return "UTC";
+  if (!tz) return "";
+
   if (tz.type === "iana") {
     const dt = DateTime.now().setZone(tz.zone);
     const offsetLabel = formatUtcOffsetLabel(dt.offset);
-    if (tz.zone === "Europe/London") return `GMT - ${offsetLabel}`;
-    const name = String(dt.offsetNameShort || tz.zone)
-      .replace(/\bGMT\b/gi, "UTC")
-      .replace(/^UTC\s*([+-]\d+(?::\d+)?)$/i, "UTC$1");
-    if (/^UTC(?:[+-]\d+(?::\d+)?)?$/i.test(name)) return offsetLabel;
-    return `${name} - ${offsetLabel}`;
+    
+    // Luxon automatically provides dynamic abbreviations like "GMT" or "BST"
+    const name = dt.offsetNameShort;
+
+    // Verify Luxon returned a real name abbreviation rather than a fallback offset string
+    const hasValidName = name && !/^[+-]\d/.test(name) && !/^GMT[+-]/i.test(name);
+    
+    return hasValidName ? `, ${name} (${offsetLabel})` : ` (${offsetLabel})`;
   }
+
+  const offsetLabel = formatUtcOffsetLabel(tz.offsetMinutes);
   const hours = Math.round(tz.offsetMinutes / 60);
   const tzName = TZ_NAMES[String(hours)];
-  const offsetLabel = formatUtcOffsetLabel(tz.offsetMinutes);
-  if (tzName) return `${tzName} - ${offsetLabel}`;
-  return offsetLabel;
+  
+  return tzName ? `, ${tzName} (${offsetLabel})` : ` (${offsetLabel})`;
 }
 
 function getDateExampleFormat(tz) {
@@ -4113,6 +4117,7 @@ function buildTimezoneSelectRow(customId = "select_timezone_iana") {
   return new ActionRowBuilder().addComponents(select);
 }
 
+
 function buildRequestModal(userId, tz, pickedTitleLabel, pickedTitleDescription) {
   const descAbbrevMap = {
     "Recruitment speed +10%": "recruit. +10%",
@@ -4139,7 +4144,7 @@ function buildRequestModal(userId, tz, pickedTitleLabel, pickedTitleDescription)
 
   const coords = new TextInputBuilder()
     .setCustomId("coordinates")
-    .setLabel("Coords (e.g. 123:456)")
+    .setLabel("Coords (e.g. '123:456')")
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setPlaceholder("123:456");
@@ -4164,7 +4169,7 @@ function buildRequestModal(userId, tz, pickedTitleLabel, pickedTitleDescription)
     .setLabel("Comments")
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
-    .setPlaceholder("Anything the guardian should know…");
+    .setPlaceholder("Anything the Guardian should know…");
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(username),
@@ -5541,7 +5546,7 @@ client.on("interactionCreate", async (interaction) => {
 
       if (!tz) {
         return interaction.reply({
-          content: "One-time setup: select your timezone so reservation times convert to UTC correctly.",
+          content: "One-time setup: select your timezone so reservation times convert to UTC correctly. (Dismiss me after)",
           components: [buildTimezoneSelectRow()],
           flags: MessageFlags.Ephemeral,
         });
@@ -5566,7 +5571,7 @@ client.on("interactionCreate", async (interaction) => {
           ts: Date.now(),
         });
       await interaction.reply({
-          content: "One-time setup: select your timezone so reservation times convert to UTC correctly.",
+          content: "One-time setup: select your timezone so reservation times convert to UTC correctly. (Dismiss me after)",
           components: [buildTimezoneSelectRow()],
           flags: MessageFlags.Ephemeral,
         });
