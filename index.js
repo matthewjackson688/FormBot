@@ -4008,21 +4008,24 @@ function getTimezoneLabel(tz) {
   if (tz.type === "iana") {
     const dt = DateTime.now().setZone(tz.zone);
     const offsetLabel = formatUtcOffsetLabel(dt.offset);
-    
-    // Luxon automatically provides dynamic abbreviations like "GMT" or "BST"
-    const name = dt.offsetNameShort;
+    let name = dt.offsetNameShort;
 
-    // Verify Luxon returned a real name abbreviation rather than a fallback offset string
+    // Handle UK zone explicitly to guarantee proper "BST" vs "GMT" switching
+    if (tz.zone === "Europe/London") {
+      name = dt.isInDST ? "BST" : "GMT";
+    }
+
+    // Ensure we have a valid text abbreviation and not a raw offset string fallback
     const hasValidName = name && !/^[+-]\d/.test(name) && !/^GMT[+-]/i.test(name);
     
-    return hasValidName ? `, ${name} (${offsetLabel})` : ` (${offsetLabel})`;
+    return hasValidName ? `, ${name} (${offsetLabel})` : `, ${offsetLabel}`;
   }
 
   const offsetLabel = formatUtcOffsetLabel(tz.offsetMinutes);
   const hours = Math.round(tz.offsetMinutes / 60);
   const tzName = TZ_NAMES[String(hours)];
   
-  return tzName ? `, ${tzName} (${offsetLabel})` : ` (${offsetLabel})`;
+  return tzName ? `, ${tzName} (${offsetLabel})` : `, ${offsetLabel}`;
 }
 
 function getDateExampleFormat(tz) {
