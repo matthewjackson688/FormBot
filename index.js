@@ -5095,7 +5095,7 @@ client.on("interactionCreate", async (interaction) => {
     // /spreadsheet
     if (interaction.isChatInputCommand() && interaction.commandName === "spreadsheet") {
       return interaction.reply({
-        content: "https://docs.google.com/spreadsheets/d/1P8ZeMLRpwzg3wjaElc6OoUfnw6eUy6G8MT0TfCjWQZA/edit?usp=sharing",
+        content: "https://docs.google.com/spreadsheets/d/e/2PACX-1vTGR4qkMpraidLGxbj65w9lT45NjwiAHVvQiTPJ4CIW3tK8YFizl2VYtkxCc4sA7Us2KdbGJHFl3Mi1/pubhtml?gid=0&single=true",
         flags: MessageFlags.Ephemeral,
       });
     }
