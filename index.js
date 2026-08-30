@@ -4162,7 +4162,7 @@ function buildRequestModal(userId, tz, pickedTitleLabel, pickedTitleDescription)
 
   const resDate = new TextInputBuilder()
     .setCustomId("reservation_date")
-    .setLabel(`Reservation Date (${tzLabel})`)
+    .setLabel(`Reservation Date ${tzLabel}`)
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setPlaceholder(`${dateExample}`);
