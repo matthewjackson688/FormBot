@@ -4155,7 +4155,7 @@ function buildRequestModal(userId, tz, pickedTitleLabel, pickedTitleDescription)
 
   const resTime = new TextInputBuilder()
     .setCustomId("reservation_time")
-    .setLabel(`Reservation Time (${tzLabel})`)
+    .setLabel(`Reservation Time ${tzLabel}`)
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setPlaceholder("now - 14:30 - 1pm");
