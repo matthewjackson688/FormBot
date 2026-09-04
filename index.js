@@ -6681,6 +6681,17 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 if (pm2io && typeof pm2io.action === "function") {
+
+  pm2io.action("panel-reset", async (reply) => {
+    try {
+      await ensurePanel(client, { cleanupExtra: true });
+      reply({ success: true, message: "Panel reset completed." });
+    } catch (e) {
+      console.error("PM2 panel-reset failed:", e);
+      reply({ success: false, message: e.message });
+    }
+  });
+
   pm2io.action("timezone", (data, reply) => {
     const responder = typeof reply === "function" ? reply : data;
     try {
