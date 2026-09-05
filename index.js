@@ -6716,77 +6716,139 @@ if (pm2io && typeof pm2io.action === "function") {
 
   pm2io.action("panel-reset", async (reply) => {
     try {
-      await ensurePanel(client, { cleanupExtra: true });
-      reply({ success: true, message: "Panel reset completed." });
-    } catch (e) {
-      console.error("PM2 panel-reset failed:", e);
-      reply({ success: false, message: e.message });
-    }
-  });
-  pm2io.action("panel-reset", async (reply) => {
-    try {
       console.log("🔄 PM2 panel-reset: starting timers rebuild...");
 
       // 1. Recreate /timers in both configured panel channels.
-      for (const channelId of TARGET_PANEL_CHANNEL_IDS) {
-        await runTimersInChannel(client, channelId);
+      const timersText = await fetchTimersText({ cacheOnly: true });
+
+      if (!timersText) {
+        await refreshTimersSnapshotInBackground().catch(() => {});
+        throw new Error("Timers cache is not ready");
       }
+
+      for (const channelId of TARGET_PANEL_CHANNEL_IDS) {
+        const channel = await getTextBasedChannel(client, channelId);
+
+        if (!channel) {
+          throw new Error(`Timers channel is not a text channel: ${channelId}`);
+        }
+
+        const existing = timersMessageByChannel.get(String(channelId));
+
+        if (existing?.intervalId) {
+          clearInterval(existing.intervalId);
+        }
+
+        const msg = await channel.send(timersText);
+
+        const intervalId = startTimersInterval(
+          client,
+          String(channelId),
+          msg.id
+        );
+
+        timersMessageByChannel.set(String(channelId), {
+          messageId: msg.id,
+          intervalId,
+          lastRenderedContent: timersText,
+          lastVerifiedAt: Date.now(),
+        });
+
+        console.log(
+          `✅ /timers recreated in channel ${channelId} (${msg.id})`
+        );
+      }
+
+      persistTimersStore();
 
       // 2. Delete all existing panel messages in both channels.
       for (const channelId of TARGET_PANEL_CHANNEL_IDS) {
         const channel = await getTextBasedChannel(client, channelId);
+
         if (!channel) continue;
 
-        const panelMessages = await findPanelMessages(channel, client).catch(() => []);
+        const panelMessages = await findPanelMessages(
+          channel,
+          client
+        ).catch(() => []);
 
         for (const panelMessage of panelMessages) {
           await panelMessage.delete().catch(() => {});
         }
 
-        console.log(`🗑️ Deleted ${panelMessages.length} old panel(s) in ${channelId}`);
+        console.log(
+          `🗑️ Deleted ${panelMessages.length} old panel(s) in ${channelId}`
+        );
       }
 
-      // 3. Forget the old stored panel message IDs.
+      // 3. Clear stored panel message IDs.
       clearPanelMessageId();
 
-      // 4. Recreate the panels cleanly.
+      // 4. Recreate clean panels.
       await ensurePanel(client, { cleanupExtra: true });
 
       console.log("✅ PM2 panel-reset completed.");
-      reply({ success: true, message: "Timers rebuilt and panels reset." });
+
+      reply({
+        success: true,
+        message: "Timers rebuilt and panels reset.",
+      });
+
     } catch (e) {
       console.error("PM2 panel-reset failed:", e);
-      reply({ success: false, message: e.message });
+
+      reply({
+        success: false,
+        message: e.message,
+      });
     }
   });
+
   pm2io.action("timezone", (data, reply) => {
     const responder = typeof reply === "function" ? reply : data;
+
     try {
       const raw =
         typeof reply === "function"
           ? data
           : responder?.args ?? responder?.body ?? responder;
+
       let userId = "";
+
       if (Array.isArray(raw)) {
         userId = String(raw[0] ?? "").trim();
       } else if (raw && typeof raw === "object") {
-        userId = String(raw.userId ?? raw.id ?? raw.args?.[0] ?? "").trim();
+        userId = String(
+          raw.userId ?? raw.id ?? raw.args?.[0] ?? ""
+        ).trim();
       } else if (raw != null) {
         userId = String(raw).trim();
       }
+
       if (!userId) {
-        responder({ ok: false, error: "missing_user_id" });
+        responder({
+          ok: false,
+          error: "missing_user_id",
+        });
         return;
       }
+
       const tz = readJsonSafe(TZ_STORE_PATH, {})[userId] || null;
-      responder({ ok: true, userId, timezone: tz });
+
+      responder({
+        ok: true,
+        userId,
+        timezone: tz,
+      });
+
     } catch (e) {
-      responder({ ok: false, error: "lookup_failed" });
+      responder({
+        ok: false,
+        error: "lookup_failed",
+      });
     }
   });
 }
-
-process.on("message", (packet) => {
   try {
     if (!packet || packet.type !== "process:msg") return;
     const data = packet.data || {};
