@@ -3878,7 +3878,7 @@ function buildRemindDetailsModal(draft = {}, tzLabel = "UTC") {
 
   const timeInput = new TextInputBuilder()
     .setCustomId("remind_time")
-    .setLabel(`Reminder Time (${tzLabel})`)
+    .setLabel(`Reminder Time${tzLabel}`)
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setPlaceholder("23:42 or in 1 hour 30 minutes");
@@ -3906,7 +3906,7 @@ function buildRemindInDetailsModal(rowSerial, draft = {}, tzLabel = "UTC") {
 
   const timeInput = new TextInputBuilder()
     .setCustomId("remind_in_time")
-    .setLabel(`Reminder Time (${tzLabel})`)
+    .setLabel(`Reminder Time${tzLabel}`)
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setPlaceholder("23:42 or in 1 hour 30 minutes");
