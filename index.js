@@ -6849,6 +6849,7 @@ if (pm2io && typeof pm2io.action === "function") {
     }
   });
 }
+process.on("message", (packet) => {
   try {
     if (!packet || packet.type !== "process:msg") return;
     const data = packet.data || {};
