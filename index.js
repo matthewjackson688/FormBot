@@ -1278,27 +1278,24 @@ async function clearEntireChannel(channel) {
   while (true) {
     const messages = await channel.messages.fetch({ limit: 100 });
 
-    if (messages.size === 0) break;
-
-    const deletable = messages.filter(
-      (message) =>
-        Date.now() - message.createdTimestamp <
-        14 * 24 * 60 * 60 * 1000
-    );
-
-    if (deletable.size > 0) {
-      const deleted = await channel.bulkDelete(deletable, true);
-      deletedCount += deleted.size;
-      continue;
+    if (messages.size === 0) {
+      break;
     }
 
-    // Remaining messages are older than Discord's bulk-delete limit.
     for (const message of messages.values()) {
-      await message.delete().catch(() => {});
-      deletedCount++;
-    }
+      try {
+        await message.delete();
+        deletedCount++;
+      } catch (err) {
+        // Another process/event may have deleted the message already.
+        // Discord reports that as "Unknown Message" (10008), which is harmless here.
+        if (err?.code === 10008) {
+          continue;
+        }
 
-    break;
+        throw err;
+      }
+    }
   }
 
   console.log(
