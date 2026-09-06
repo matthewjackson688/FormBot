@@ -1272,6 +1272,41 @@ const reminderMeta = new Map(); // rowSerial -> { title, username, channelId, so
 const manualReminderTimers = new Map(); // reminderId -> Timeout
 const MAX_TIMEOUT_MS = 2_147_483_647; // ~24.8 days
 const timersMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
+async function clearEntireChannel(channel) {
+  let deletedCount = 0;
+
+  while (true) {
+    const messages = await channel.messages.fetch({ limit: 100 });
+
+    if (messages.size === 0) break;
+
+    const deletable = messages.filter(
+      (message) =>
+        Date.now() - message.createdTimestamp <
+        14 * 24 * 60 * 60 * 1000
+    );
+
+    if (deletable.size > 0) {
+      const deleted = await channel.bulkDelete(deletable, true);
+      deletedCount += deleted.size;
+      continue;
+    }
+
+    // Remaining messages are older than Discord's bulk-delete limit.
+    for (const message of messages.values()) {
+      await message.delete().catch(() => {});
+      deletedCount++;
+    }
+
+    break;
+  }
+
+  console.log(
+    `🗑️ Cleared ${deletedCount} message(s) from ${channel.id}`
+  );
+
+  return deletedCount;
+}
 const reservationsMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
 const interactionCooldowns = new Map(); // key -> expiresAtMs
 const doneToggleInFlight = new Set(); // rowSerial keys currently toggling done/not done
@@ -6715,94 +6750,91 @@ process.on("unhandledRejection", (reason) => console.error("Unhandled promise re
 if (pm2io && typeof pm2io.action === "function") {
 
   pm2io.action("panel-reset", async (reply) => {
-    try {
-      console.log("🔄 PM2 panel-reset: starting timers rebuild...");
+  try {
+    console.log("🔄 PM2 panel-reset: starting full channel rebuild...");
 
-      // 1. Recreate /timers in both configured panel channels.
-      const timersText = await fetchTimersText({ cacheOnly: true });
+    // 1. Make sure the timers cache is ready BEFORE deleting anything.
+    const timersText = await fetchTimersText({ cacheOnly: true });
 
-      if (!timersText) {
-        await refreshTimersSnapshotInBackground().catch(() => {});
-        throw new Error("Timers cache is not ready");
-      }
-
-      for (const channelId of TARGET_PANEL_CHANNEL_IDS) {
-        const channel = await getTextBasedChannel(client, channelId);
-
-        if (!channel) {
-          throw new Error(`Timers channel is not a text channel: ${channelId}`);
-        }
-
-        const existing = timersMessageByChannel.get(String(channelId));
-
-        if (existing?.intervalId) {
-          clearInterval(existing.intervalId);
-        }
-
-        const msg = await channel.send(timersText);
-
-        const intervalId = startTimersInterval(
-          client,
-          String(channelId),
-          msg.id
-        );
-
-        timersMessageByChannel.set(String(channelId), {
-          messageId: msg.id,
-          intervalId,
-          lastRenderedContent: timersText,
-          lastVerifiedAt: Date.now(),
-        });
-
-        console.log(
-          `✅ /timers recreated in channel ${channelId} (${msg.id})`
-        );
-      }
-
-      persistTimersStore();
-
-      // 2. Delete all existing panel messages in both channels.
-      for (const channelId of TARGET_PANEL_CHANNEL_IDS) {
-        const channel = await getTextBasedChannel(client, channelId);
-
-        if (!channel) continue;
-
-        const panelMessages = await findPanelMessages(
-          channel,
-          client
-        ).catch(() => []);
-
-        for (const panelMessage of panelMessages) {
-          await panelMessage.delete().catch(() => {});
-        }
-
-        console.log(
-          `🗑️ Deleted ${panelMessages.length} old panel(s) in ${channelId}`
-        );
-      }
-
-      // 3. Clear stored panel message IDs.
-      clearPanelMessageId();
-
-      // 4. Recreate clean panels.
-      await ensurePanel(client, { cleanupExtra: true });
-
-      console.log("✅ PM2 panel-reset completed.");
-
-      reply({
-        success: true,
-        message: "Timers rebuilt and panels reset.",
-      });
-
-    } catch (e) {
-      console.error("PM2 panel-reset failed:", e);
-
-      reply({
-        success: false,
-        message: e.message,
-      });
+    if (!timersText) {
+      await refreshTimersSnapshotInBackground().catch(() => {});
+      throw new Error("Timers cache is not ready");
     }
-  });
+
+    // 2. Stop all existing timer intervals.
+    for (const [channelId, entry] of timersMessageByChannel.entries()) {
+      if (entry?.intervalId) {
+        clearInterval(entry.intervalId);
+      }
+    }
+
+    // 3. Completely clear every configured panel channel.
+    for (const channelId of TARGET_PANEL_CHANNEL_IDS) {
+      const channel = await getTextBasedChannel(client, channelId);
+
+      if (!channel) {
+        throw new Error(`Panel channel is not a text channel: ${channelId}`);
+      }
+
+      await clearEntireChannel(channel);
+    }
+
+    // 4. Clear all stored timer message references.
+    timersMessageByChannel.clear();
+    persistTimersStore();
+
+    // 5. Clear all stored panel message references.
+    clearPanelMessageId();
+
+    // 6. Recreate one fresh /timers message in every panel channel.
+    for (const channelId of TARGET_PANEL_CHANNEL_IDS) {
+      const channel = await getTextBasedChannel(client, channelId);
+
+      if (!channel) {
+        throw new Error(`Timers channel is not a text channel: ${channelId}`);
+      }
+
+      const msg = await channel.send(timersText);
+
+      const intervalId = startTimersInterval(
+        client,
+        String(channelId),
+        msg.id
+      );
+
+      timersMessageByChannel.set(String(channelId), {
+        messageId: msg.id,
+        intervalId,
+        lastRenderedContent: timersText,
+        lastVerifiedAt: Date.now(),
+      });
+
+      console.log(
+        `✅ /timers recreated in channel ${channelId} (${msg.id})`
+      );
+    }
+
+    persistTimersStore();
+
+    // 7. Recreate one clean panel in every panel channel.
+    await ensurePanel(client, { cleanupExtra: true });
+
+    console.log("✅ PM2 panel-reset completed: all 3 channels rebuilt.");
+
+    reply({
+      success: true,
+      message: "All panel channels completely cleared and rebuilt.",
+    });
+
+  } catch (e) {
+    console.error("PM2 panel-reset failed:", e);
+
+    reply({
+      success: false,
+      message: e.message,
+    });
+  }
+});
 
   pm2io.action("timezone", (data, reply) => {
     const responder = typeof reply === "function" ? reply : data;
@@ -6870,4 +6902,3 @@ process.on("message", (packet) => {
 });
 
 client.login(DISCORD_TOKEN);
-
