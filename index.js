@@ -2737,29 +2737,16 @@ function renderTimersTextFromSnapshot() {
     return hh > 0 ? `${hh}h ${mm}m` : `${mm}m`;
   };
   const formatRemaining = (title) => {
-    const possible = nextPossibleByTitle.get(title);
-    const possibleSeconds = possible?.secondsUntil;
-    const possibleFormatted = formatDuration(possibleSeconds);
+    const cooldownSeconds = Number(activeCooldownByTitle.get(title));
 
-    const nextReservation = nextByTitle.get(title);
-    const nextReservationFormatted = formatDuration(nextReservation?.secondsUntil);
-    if (
-      nextReservationFormatted &&
-      nextReservationFormatted !== "Available" &&
-      (!Number.isFinite(possibleSeconds) || possibleSeconds <= 59)
-    ) {
-      return nextReservationFormatted;
+    // "Time left until title is available" only reflects a
+    // currently active 1-hour cooldown from recent use.
+    // A future reservation does not make the title unavailable now.
+    if (!Number.isFinite(cooldownSeconds) || cooldownSeconds <= 59) {
+      return "Available";
     }
 
-    if (possibleFormatted) return possibleFormatted;
-
-    // Fallback for old Apps Script snapshot shape (elapsed-only).
-    const elapsedSeconds = byTitle.get(title);
-    if (!Number.isFinite(elapsedSeconds)) return "Available";
-    const remaining = 3600 - elapsedSeconds;
-    if (remaining <= 59) return "Available";
-    const mm = Math.floor(remaining / 60);
-    return `${mm}m`;
+    return formatDuration(cooldownSeconds);
   };
   for (const title of titles) {
     const manualStarts = manualStartsByTitle.get(title) || [];
